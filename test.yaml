@@ -1,0 +1,8 @@
+# ✅ Complete recommended configuration
+resources:
+  requests:
+    cpu: "500m"       # CPU request only
+    memory: "512Mi"
+  limits:
+    # cpu: not set    # No CPU limit - prevents throttling
+    memory: "512Mi"   # Memory limit required - prevents OOM
