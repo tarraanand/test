@@ -72,3 +72,5 @@ CPU	requests only, no limits	Prevents throttling, allows bursting
 This approach will significantly reduce OOM kills and improve application stability.
 
 Let me know if you have any questions!
+
+For CPU, the best practice in large-scale Kubernetes is to set requests only, no limits. This prevents unnecessary CPU throttling while allowing apps to burst when needed.
