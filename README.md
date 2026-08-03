@@ -1,76 +1,50 @@
-Subject: Addressing OOM Kills - Resource Configuration Best Practices
+# IQ_ENV_Deployment
 
-Hi Team,
+Pull-based file deployment between DEV / QA / PROD environments across 11 servers.
 
-I've noticed we're experiencing frequent OOM (Out of Memory) kills and receiving requests to increase memory limits. I found that requests and limits are not equal in most of our resource configurations.
+## Files
+- `IQ_ENV_Deployment.ps1` - main script (runs continuously, one instance per server)
+- `servers.ini` - server / cluster definitions (deploy to `E:\Data\se-iciq\Se-Deploy\`)
+- `Test-Deployment.ps1` - self-contained test harness (simulates all 11 servers locally, 18 assertions)
 
-I'd like to share some best practices to help prevent these issues:
+## How it works
+Each server runs the same script under the `callssp` account and, every 5 minutes, pulls the files that are destined for it:
 
-1. Set Memory Requests = Limits
-When requests ≠ limits, pods get Burstable QoS class and are first to be evicted under node memory pressure. Setting them equal gives Guaranteed QoS class which is stable and predictable.
+| Local server | Pulls from | Trigger folders scanned |
+|---|---|---|
+| QA (Q1, Q2) | DEV servers + the other QA server | `2QA` |
+| PROD (all 7) | QA servers + other PROD servers | `2PROD`, plus `2PRODC1` or `2PRODC2` depending on cluster membership |
+| DEV (D1, D2) | nothing (DEV is source only; DEV-to-DEV is excluded per requirement) | - |
 
-# ❌ Current: requests ≠ limits (Burstable QoS - prone to OOM/eviction)
-resources:
-  requests:
-    memory: "256Mi"
-  limits:
-    memory: "1Gi"
+Destination path: the trigger folder is removed and the path re-anchored one level above `Se-Deploy`:
+`...\Se-Deploy\2QA\Se-common\bat\ABTest.bat` -> `E:\Data\se-iciq\Se-common\bat\ABTest.bat`
 
-# ✅ Recommended: requests = limits (Guaranteed QoS - stable and predictable)
-resources:
-  requests:
-    memory: "512Mi"
-  limits:
-    memory: "512Mi"
-2. Use VPA in "Off" Mode for Right-Sizing
-Instead of guessing memory values, use VPA (Vertical Pod Autoscaler) in "Off" mode. VPA in Auto mode restarts pods which can cause downtime. Off mode gives recommendations without disruption.
+Completion tracking: each pulling server registers itself (with a timestamp) in a `.done` file on the **source** server under `Se-Deploy\.done\`, protected by a `.lock` file against concurrent updates. When every expected target is registered and no error occurred, the source file is deleted; the `.done` file is kept as an audit trail.
 
-apiVersion: autoscaling.k8s.io/v1
-kind: VerticalPodAutoscaler
-metadata:
-  name: my-app-vpa
-spec:
-  targetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: my-app
-  updatePolicy:
-    updateMode: "Off"  # Recommendations only, no restarts
+Error handling: if the destination folder does not exist, it is **not** created. The source file is renamed to `<filename>.ERROR_MISSING_DIR`, logged as FAIL, and skipped on all subsequent runs until manually corrected.
 
-3. Use HPA + Karpenter for Scaling
-Many teams avoid VPA Auto mode and instead use HPA + Karpenter:
+File selection excludes `.done`, `.lock`, `.log` files, previously failed `*.ERROR_*` files, and hidden/system files.
 
-HPA → Scale pods horizontally (more replicas)
-Karpenter → Scale nodes efficiently
+Logging: `E:\Data\se-iciq\Se-Deploy\Logs\IQ_ENV_Deployment_YYYYMMDD.log`, pipe-delimited (`timestamp|server|action|source|destinations|status|error`), auto-cleanup after 7 days.
 
-apiVersion: autoscaling/v2
-kind: HorizontalPodAutoscaler
-metadata:
-  name: my-app-hpa
-spec:
-  scaleTargetRef:
-    apiVersion: apps/v1
-    kind: Deployment
-    name: my-app
-  minReplicas: 2
-  maxReplicas: 10
-  metrics:
-    - type: Resource
-      resource:
-        name: memory
-        target:
-          type: Utilization
-          averageUtilization: 80
+## Running
+Production (default paths, resolves its own name from servers.ini):
+```powershell
+powershell.exe -ExecutionPolicy Bypass -File E:\Scripts\IQ_ENV_Deployment.ps1
+```
+Recommended: register it as a Windows service (NSSM) or a Scheduled Task running as `callssp` at startup. Alternatively schedule it every 5 minutes with `-RunOnce` instead of the built-in loop.
 
-4. CPU: Set Requests Only, No Limits
-For CPU, the best practice in large-scale Kubernetes is to set requests only, no limits. This prevents unnecessary CPU throttling while allowing apps to burst when needed.
+Useful parameters: `-ServerName Q1` (force identity), `-RunOnce` (single cycle), `-IntervalMinutes`, `-RemoteRootTemplate` (defaults to `\\{fqdn}\E$\Data\se-iciq\Se-Deploy`).
 
-# ✅ Complete recommended configuration
-Resource	Best Practice	Reason
-Memory	requests = limits	Prevents OOM kills, Guaranteed QoS
-CPU	requests only, no limits	Prevents throttling, allows bursting
-This approach will significantly reduce OOM kills and improve application stability.
+Test locally (works with Windows PowerShell 5.1 or PowerShell 7):
+```powershell
+.\Test-Deployment.ps1
+```
 
-Let me know if you have any questions!
-
-For CPU, the best practice in large-scale Kubernetes is to set requests only, no limits. This prevents unnecessary CPU throttling while allowing apps to burst when needed.
+## Assumptions made - please confirm with the manager
+1. **Pull chain for 2PROD**: PROD pulls from QA (and cross-copies from other PROD). Files must therefore flow DEV -> QA -> PROD; DEV -> PROD directly is covered only if someone drops the file in `2PROD` on a QA server. If PROD must also pull directly from DEV, one line in `Get-PullPlan` adds it.
+2. **2DEV folder**: listed under "included files" in the requirement, but DEV-to-DEV transfer is explicitly excluded and nothing pulls from `2DEV`. Assumed unused; clarify its purpose.
+3. **Remote access**: default is admin share `\\<fqdn>\E$\...`. If a dedicated share (e.g. `\\<fqdn>\se-deploy`) exists instead, adjust `-RemoteRootTemplate`.
+4. **.done retention**: `.done` files are kept forever as audit trail. Add a cleanup rule if desired.
+5. **servers.ini FQDNs**: the values in the requirement contained obvious typos (`I\`, `II`, commas); the sample ini normalizes them - verify before go-live.
+6. **File size**: no size check is enforced ("files must be small" was treated as informational). A max-size guard can be added if needed.
