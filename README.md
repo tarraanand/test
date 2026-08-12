@@ -134,38 +134,28 @@ already retried) and CRITICAL (access denied, disk full, unexpected error).
 
 ## Points I need your confirmation on
 
-1. The interval is 5 minutes at the beginning of the requirement and 10 minutes in the
-   architecture part, the INI and the deployment checklist. I used 10, it is one line in
-   servers.ini.
-
-2. Max file size is 100MB in the INI section and 10MB in the risk section. I used 100.
-
-3. The chain DEV to QA to PROD. Today DEV to QA writes into QA\se-deploy\D1, but QA to PROD
+1. The chain DEV to QA to PROD. Today DEV to QA writes into QA\se-deploy\D1, but QA to PROD
    reads the QA folders themselves (E:\Data\se-iciq\Se-common\bat). These are not the same
    folders, so a file created on D1 will never arrive on PROD by itself. Either PROD has to
    pull from the se-deploy\D1 folders of QA (there is a [SOURCEROOT] section ready for that
    in the INI, just to uncomment), or something has to move the files from se-deploy\D1
    into the QA folders. Which one do you want?
 
-4. The INI gives the server names but no share name. I assumed the E$ administrative share,
+2. The INI gives the server names but no share name. I assumed the E$ administrative share,
    which means callssp must be local admin on the source servers. If not, we need a normal
    share created on the 11 servers and then only SourceRootTemplate changes.
 
-5. The requirement says write-only access on the destination. That cannot work, comparing
+3. The requirement says write-only access on the destination. That cannot work, comparing
    the timestamps needs read access on the destination folder too. So callssp needs read
    and write locally, and read on the source shares.
 
-6. S3 is in the [PROD] section but points to SYQDDWHDEV3, which looks like a DEV machine.
-   Can you confirm it is correct?
-
-7. Alerts (phase 2): tell me the SMTP server, the sender, the recipients and when you want
+4. Alerts (phase 2): tell me the SMTP server, the sender, the recipients and when you want
    a mail (every CRITICAL line, or only after several failures in a row). The statuses are
    already there, it is only the sending part to add.
 
-8. Robocopy is mentioned in the performance part but I did not use it. With small files and
-   one log line per file (size, duration, status) the direct copy plus parallel execution
-   gives a better log and less delay. If one day we have to move big folders, Robocopy per
-   include folder would be better and I can change that part.
+8. Robocopy I did not use it. With small files and one log line per file
+   (size, duration, status) the direct copy plus parallel execution gives a better log and
+   less delay. If one day we have to move big folders, Robocopy per include folder would be better.
 
-9. The script is written for PowerShell 5.1 and I tested it on 7. It should be run once on
-   one of the real servers to confirm the 5.1 version behaves the same.
+10. The script is written for PowerShell 5.1 . It should be run once on one of the real servers
+    to confirm the 5.1 version behaves the same.
