@@ -1,136 +1,171 @@
 # se-deploy file synchronization
 
-Pull-based synchronization of metadata files, DEV → QA and QA → PROD, driven entirely by
-`servers.ini`. No value is hardcoded in the script.
+Two files:
 
-| File | Role |
-|---|---|
-| `Sync-SeDeploy.ps1` | The script. Runs on every destination server. |
-| `servers.ini` | All configuration. Deploy to `E:\Data\se-iciq\se-deploy\`. |
-| `Test-SyncSeDeploy.ps1` | Test harness. Builds a throwaway lab simulating the 11 servers. |
+- Sync-SeDeploy.ps1 - the script, same copy on every server
+- servers.ini - all the configuration (servers, folders, limits)
+
+Both go to E:\Data\se-iciq\se-deploy\.
 
 ## How it works
 
-1. The script identifies the local server by matching the computer name against the values
-   in `[DEV]` / `[QA]` / `[PROD]` (or `-LocalServerCode` if the names differ).
-2. `[MAPPING]` gives the source environment (`QA = DEV`, `PROD = QA`). An environment can
-   never be its own source — `QA = QA` is rejected at startup, so DEV→DEV cannot happen.
-3. For every server of the source environment, each `[INCLUDE]` path is scanned under
-   `SourceRootTemplate` (default `\\HOST\E$\Data\se-iciq`), `[EXCLUDE]` patterns are applied,
-   and files whose `LastWriteTime` is newer than the local copy are pulled into
-   `DestinationBasePath\<SOURCE_CODE>\<relative path>`:
+The script uses the pull mechanism described in the requirement. It runs on the
+destination server, finds its own server code by comparing the computer name with the
+entries in servers.ini, reads [MAPPING] to know where to pull from (QA takes from DEV,
+PROD takes from QA), and copies the changed files from every server of that environment.
 
-```
-Q1 pulls D1, D2  ->  E:\Data\se-iciq\se-deploy\D1\Se-common\bat\script.ps1
-                     E:\Data\se-iciq\se-deploy\D2\Se-common\bat\script.ps1
-P1 pulls Q1, Q2  ->  E:\Data\se-iciq\se-deploy\Q1\...  and  ...\Q2\...
-```
+Files are copied into a folder named after the source server:
 
-Copies run in a throttled runspace pool (`MaxConcurrentCopies`), the source timestamp is
-preserved on the copy so nothing is ever transferred twice, and a lock file prevents
-overlapping runs.
+    on Q1:   E:\Data\se-iciq\se-deploy\D1\Se-common\bat\script.ps1
+             E:\Data\se-iciq\se-deploy\D2\Se-common\bat\script.ps1
+    on P1:   E:\Data\se-iciq\se-deploy\Q1\...
+             E:\Data\se-iciq\se-deploy\Q2\...
+
+A file is copied when it does not exist on the destination, when its LastWriteTime is
+newer than the destination file (with a small tolerance for the clock difference between
+servers), or when the size is different. No hash is calculated. After the copy the source
+timestamp is applied to the destination file, otherwise the copy would look newer than the
+source and everything would be copied again on the next run.
+
+Copies run in parallel (MaxConcurrentCopies) and a lock file avoids two runs at the same
+time. Since [MAPPING] is checked at startup, an environment can never be its own source,
+so DEV to DEV or QA to QA cannot happen even by mistake in the INI file.
+
+## Testing on one machine before deployment
+
+The script does not need real servers to be tested, the server entries can point to local
+folders. Create something like this:
+
+    C:\Temp\lab\D1\Se-common\bat\...     (a few test files)
+    C:\Temp\lab\D2\Se-common\bat\...
+    C:\Temp\lab\Q1\
+
+then a test INI with only these lines changed:
+
+    [GLOBAL]
+    DestinationBasePath = C:\Temp\lab\Q1\se-deploy\
+    LogPath = C:\Temp\lab\Q1\se-deploy\Logs\
+    SourceRootTemplate = {SERVER}
+    MinFreeSpaceMB = 1
+
+    [MAPPING]
+    QA = DEV
+
+    [DEV]
+    D1 = C:\Temp\lab\D1
+    D2 = C:\Temp\lab\D2
+
+    [QA]
+    Q1 = C:\Temp\lab\Q1
+
+SourceRootTemplate = {SERVER} means the folder is taken as it is, without adding
+\E$\Data\se-iciq. Keep the [INCLUDE] and [EXCLUDE] sections as they are.
+
+Then run:
+
+    .\Sync-SeDeploy.ps1 -ConfigPath C:\Temp\lab\servers.ini -RunOnce -LocalServerCode Q1 -WhatIf
+    .\Sync-SeDeploy.ps1 -ConfigPath C:\Temp\lab\servers.ini -RunOnce -LocalServerCode Q1
+
+-LocalServerCode is needed here because one machine plays the role of several servers.
+On the real servers it is not used, the computer name is enough.
+
+Things worth checking during the test: the second run must copy nothing, a modified file
+must be copied again on the next run, the excluded files must not appear in the
+destination, and -WhatIf must not create anything.
+
+I ran this scenario plus the exclusion patterns, the oversized file case, the lock file,
+the log retention and a 1000 files load test (around 10 seconds for the first copy, under
+2 seconds for a run with no change).
 
 ## Deployment
 
-1. Copy both files to `E:\Data\se-iciq\se-deploy\` on the QA and PROD servers.
-   DEV servers are sources only and do not need the script.
-2. Adjust `SourceRootTemplate` if `E$` is not usable by `callssp` (see open question 4).
-3. Baseline copy: do the initial manual DEV→QA and QA→PROD copy as planned. The script
-   would do it by itself, but the first run would then be a very large one.
-4. Dry run: `.\Sync-SeDeploy.ps1 -RunOnce -WhatIf` and review the log.
-5. Scheduled Task under `callssp`, repeating every `SyncIntervalMinutes`:
+1. Copy the two files to E:\Data\se-iciq\se-deploy\ on the QA and PROD servers. The DEV
+   servers are only sources, they do not need the script.
+2. Do the manual baseline copy DEV to QA and QA to PROD as planned, so the first run is
+   not a huge one.
+3. Run once with -WhatIf and check the log.
+4. Create the Scheduled Task under callssp:
 
-```
-schtasks /Create /TN "SE-Deploy Sync" /RU "DOMAIN\callssp" /RP * /SC MINUTE /MO 10 ^
-  /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\Data\se-iciq\se-deploy\Sync-SeDeploy.ps1 -RunOnce" ^
-  /RL LIMITED /F
-```
+    schtasks /Create /TN "SE-Deploy Sync" /RU "DOMAIN\callssp" /RP * /SC MINUTE /MO 10
+      /TR "powershell.exe -NoProfile -ExecutionPolicy Bypass -File E:\Data\se-iciq\se-deploy\Sync-SeDeploy.ps1 -RunOnce"
+      /RL LIMITED /F
 
-Exit codes: `0` success, `1` at least one copy failed, `3` fatal (bad INI, unknown server).
+Exit codes: 0 = fine, 1 = at least one file failed to copy, 3 = configuration problem
+(INI not found, unknown server, wrong mapping).
 
-Alternatively drop `-RunOnce` and the script loops forever, sleeping between cycles — one
-task started at boot instead of a repeating task. Pick one model, not both.
+If you prefer the script to run permanently instead of a Scheduled Task every 10 minutes,
+remove -RunOnce and start it once at boot. It will then loop by itself and write a
+heartbeat line before each pause. Both models work, but only one should be used.
 
 ## Logs
 
-`E:\Data\se-iciq\se-deploy\Logs\se-deploy-sync_YYYY-MM-DD.log`, one per day,
-`LogRetentionDays` files kept in total (today included), older ones purged at each start
-and at midnight rollover.
+E:\Data\se-iciq\se-deploy\Logs\se-deploy-sync_YYYY-MM-DD.log, one file per day, 7 files
+kept in total (today included), older ones deleted at each start and at midnight.
 
-```
-2026-08-12 10:17:52 | SYSTEM | START     | v1.0.0 | Q1 | LIVE | - | - | Account: DOMAIN\callssp; PowerShell 5.1
-2026-08-12 10:17:52 | D1     | COPY      | Se-common\bat\script.ps1 | Q1 | SUCCESS  | 14B  | 87ms | -
-2026-08-12 10:17:52 | D1     | SKIP      | Se-common\bat\big.bin    | Q1 | WARNING  | 2.0MB| -    | File exceeds MaxFileSizeMB (100MB)
-2026-08-12 10:17:52 | D2     | COPY      | Se-common\bat\cfg.ini    | Q1 | CRITICAL | 0.5KB| -    | Access to the path ... is denied.
-2026-08-12 10:17:52 | SYSTEM | HEARTBEAT | Script active | Next run: 10:27:52
-2026-08-12 10:17:52 | SYSTEM | SUMMARY   | Files copied: 5 | Errors: 0 | Warnings: 2 | Avg duration: 46ms
-```
+Format is the one from the requirement:
 
-Field order is the one from the specification. In a pull model the `SERVER` column is the
-**source** server the file came from and `DESTINATION_SERVERS` is the local server doing the
-pull (see open question 6).
+    2026-08-12 10:17:52 | SYSTEM | START     | v1.0 | Q1 | LIVE | - | - | Account: DOMAIN\callssp
+    2026-08-12 10:17:52 | D1     | COPY      | Se-common\bat\script.ps1 | Q1 | SUCCESS  | 14B   | 87ms | -
+    2026-08-12 10:17:52 | D1     | SKIP      | Se-common\bat\big.bin    | Q1 | WARNING  | 120MB | -    | File bigger than MaxFileSizeMB (100MB)
+    2026-08-12 10:17:52 | D2     | COPY      | Se-common\bat\cfg.ini    | Q1 | CRITICAL | 0.5KB | -    | Access to the path ... is denied.
+    2026-08-12 10:17:52 | SYSTEM | HEARTBEAT | Script active | Next run: 10:27:52
+    2026-08-12 10:17:52 | SYSTEM | SUMMARY   | Files copied: 5 | Errors: 0 | Warnings: 2 | Avg duration: 46ms
 
-Statuses: `SUCCESS`, `WHATIF`, `WARNING`, `SKIPPED`, `FAIL` (retryable/transient),
-`CRITICAL` (permission denied, disk full, unhandled exception).
+One remark on the columns: with a pull mechanism the file comes from the source server and
+goes to the local server only, so SERVER is the source (D1, Q2, ...) and
+DESTINATION_SERVERS is the local server. In the requirement the example looks like a push
+(P1 | COPY | ... | P3,P4,P9). Tell me if you prefer the two columns the other way around.
 
-## Behaviour details
+Statuses used: SUCCESS, WHATIF, WARNING, SKIPPED, FAIL (network or temporary problem,
+already retried) and CRITICAL (access denied, disk full, unexpected error).
 
-| Topic | Behaviour |
-|---|---|
-| Change detection | `LastWriteTimeUtc` newer than destination by more than `TimestampToleranceSeconds`, or (if `CompareFileSize`) equal timestamp but different size. No hashing. |
-| Timestamps | Source `LastWriteTime` is applied to the copy, so a file is copied exactly once. |
-| Large files | `> MaxFileSizeMB` → skipped + WARNING, **unless** listed explicitly as a file in `[INCLUDE]` (e.g. `Se-temp\QSR\QSR_Excecution.log`), then copied + WARNING. |
-| Exclusions | `foo\bar\` = folder and everything below. `*.tmp` = file name match at any depth. `temp\*` = matches at root and, with `MatchExcludeAtAnyDepth`, at any depth. `Se-common\template\` is *not* caught by `temp\*`. |
-| Retries | `RetryCount` attempts with `RetryDelaySeconds` between them, for transient/network errors only. Access denied and disk full fail immediately — retrying them is pointless. |
-| Disk full | Below `MinFreeSpaceMB` the cycle is skipped, logged CRITICAL, and in continuous mode the script pauses `DiskFullPauseMinutes`. |
-| Lock file | `se-deploy-sync.lock` next to the destination root. A lock whose process is gone, or older than `LockTimeoutMinutes`, is treated as stale and removed. |
-| `-WhatIf` | Nothing is written to the destination (not even folders); the log is still written, with status `WHATIF`. |
-| Deletions | **Not** propagated. A file deleted on DEV stays on QA. |
+## A few details
 
-## Testing
+- Exclusions: a line ending with \ excludes the folder and everything below, *.tmp matches
+  the file name at any level, temp\* matches a folder named temp at any level.
+  Se-common\template\ is not caught by temp\*.
+- Files bigger than MaxFileSizeMB are skipped with a warning, except when the INI lists the
+  file by name (like Se-temp\QSR\QSR_Excecution.log), then it is copied with a warning.
+- Retries only happen on network or temporary errors. Access denied and disk full stop
+  immediately, retrying them 3 times just fills the log.
+- If the free space goes below MinFreeSpaceMB the cycle is skipped, a CRITICAL line is
+  written and the script waits 30 minutes.
+- Deletions are not propagated. A file deleted on DEV stays on QA.
 
-```powershell
-.\Test-SyncSeDeploy.ps1                   # 66 assertions
-.\Test-SyncSeDeploy.ps1 -IncludeLoadTest  # adds the 1000-file load test
-```
+## Points I need your confirmation on
 
-The harness creates the 11 servers as folders under `%TEMP%\se-deploy-lab`, generates one
-INI per simulated server, and runs the real script as a child process. Covered: exclusion
-engine (10 cases including the `template\` false-positive trap), tolerant INI parser,
-first sync, idempotent second run, change detection, oversized-file handling, `-WhatIf`,
-PROD pulling QA only (never DEV, never another PROD server), live lock / stale lock,
-7-day log retention, unreachable source, `QA = QA` rejection, unknown server code, missing
-INI, access-denied classification and exit codes, log format (9 fields, heartbeat, summary).
+1. The interval is 5 minutes at the beginning of the requirement and 10 minutes in the
+   architecture part, the INI and the deployment checklist. I used 10, it is one line in
+   servers.ini.
 
-Result of the last run: **66/66 passed**; load test 1006 files in ~14 s, no-change cycle
-over the same tree in ~2.5 s.
+2. Max file size is 100MB in the INI section and 10MB in the risk section. I used 100.
 
-## Open questions
+3. The chain DEV to QA to PROD. Today DEV to QA writes into QA\se-deploy\D1, but QA to PROD
+   reads the QA folders themselves (E:\Data\se-iciq\Se-common\bat). These are not the same
+   folders, so a file created on D1 will never arrive on PROD by itself. Either PROD has to
+   pull from the se-deploy\D1 folders of QA (there is a [SOURCEROOT] section ready for that
+   in the INI, just to uncomment), or something has to move the files from se-deploy\D1
+   into the QA folders. Which one do you want?
 
-1. **Sync interval** — 5 minutes (script purpose) or 10 minutes (architecture, INI,
-   deployment checklist)? Currently 10, one value in the INI.
-2. **Max file size** — 100 MB (INI) or 10 MB (risk mitigation)? Currently 100.
-3. **Promotion chain** — this is the important one. DEV→QA writes into
-   `QA:\...\se-deploy\D1\`, but QA→PROD reads QA's live `E:\Data\se-iciq\Se-common\bat\`.
-   A file created on D1 therefore never reaches PROD on its own. Either PROD must pull from
-   QA's `se-deploy\D1` folders (use the `[SOURCEROOT]` override), or a promotion step has to
-   move files from `se-deploy\D1` into QA's live tree. Which one is intended?
-4. **Share name** — the INI has host names but no share. `E$` (admin share) is assumed;
-   if `callssp` is not local admin on the source servers, a dedicated read-only share is
-   needed and `SourceRootTemplate` updated.
-5. **Permissions** — "write-only destination access" cannot work: comparing timestamps
-   requires *read* on the destination tree. `callssp` needs read+write locally, read remotely.
-6. **Log columns** — the example log lines look like a push (`P1 | COPY | ... | P3,P4,P9`).
-   In a pull model I log source in `SERVER` and the local server in `DESTINATION_SERVERS`.
-   Confirm, or I invert them.
-7. **`S3`** is listed under `[PROD]` but points to `SYQDDWHDEV3`, a DEV host name. Typo?
-8. **Deletions and renames** are not propagated. Confirm this is acceptable.
-9. **Do DEV servers run the script?** Currently they would log "nothing to pull" and exit.
-10. **Alerts (phase 2)** — SMTP relay, sender, recipients, and the trigger threshold
-    (every CRITICAL? N consecutive failures?). Easy to add on top of the existing statuses.
-11. **Robocopy** — not used. The spec asks for both Robocopy and per-file parallelism; with
-    small files and per-file logging (size, duration, status), native copy plus a runspace
-    pool gives better logs and better latency. If bulk transfer of large trees becomes the
-    real workload, Robocopy per include folder is the better engine and I can switch it.
-12. **PowerShell version on the servers** — the script avoids 7.x-only syntax and targets
-    5.1, but the test lab here runs 7.4. It needs one run on a real 5.1 server before rollout.
+4. The INI gives the server names but no share name. I assumed the E$ administrative share,
+   which means callssp must be local admin on the source servers. If not, we need a normal
+   share created on the 11 servers and then only SourceRootTemplate changes.
+
+5. The requirement says write-only access on the destination. That cannot work, comparing
+   the timestamps needs read access on the destination folder too. So callssp needs read
+   and write locally, and read on the source shares.
+
+6. S3 is in the [PROD] section but points to SYQDDWHDEV3, which looks like a DEV machine.
+   Can you confirm it is correct?
+
+7. Alerts (phase 2): tell me the SMTP server, the sender, the recipients and when you want
+   a mail (every CRITICAL line, or only after several failures in a row). The statuses are
+   already there, it is only the sending part to add.
+
+8. Robocopy is mentioned in the performance part but I did not use it. With small files and
+   one log line per file (size, duration, status) the direct copy plus parallel execution
+   gives a better log and less delay. If one day we have to move big folders, Robocopy per
+   include folder would be better and I can change that part.
+
+9. The script is written for PowerShell 5.1 and I tested it on 7. It should be run once on
+   one of the real servers to confirm the 5.1 version behaves the same.

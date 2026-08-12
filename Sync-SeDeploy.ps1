@@ -1,263 +1,209 @@
 <#
 .SYNOPSIS
-    Synchronizes metadata files between DEV -> QA and QA -> PROD using timestamp comparison.
+    Synchronizes metadata files between DEV->QA and QA->PROD using timestamp comparison.
 
 .DESCRIPTION
-    Pull-based file synchronization driven entirely by an INI configuration file.
+    Pull mechanism. The script runs on the destination server, finds out which server it is
+    running on (computer name lookup in servers.ini), and pulls the changed files from the
+    servers of the source environment:
 
-    The script determines which server it is running on (by hostname lookup in the INI),
-    derives its environment (DEV / QA / PROD), resolves the source environment from the
-    [MAPPING] section, and then pulls changed files from every server of the source
-    environment into a per-source-server folder underneath DestinationBasePath.
+        QA server   -> pulls from the DEV servers
+        PROD server -> pulls from the QA servers
 
-        Running on Q1 (QA)   -> pulls from D1, D2   -> E:\Data\se-iciq\se-deploy\D1, ...\D2
-        Running on P1 (PROD) -> pulls from Q1, Q2   -> E:\Data\se-iciq\se-deploy\Q1, ...\Q2
+    Files are copied to DestinationBasePath\<source server code>\<relative path>, for
+    example E:\Data\se-iciq\se-deploy\D1\Se-common\bat\script.ps1.
 
-    Transfers inside the same environment never happen: the mapping table only ever points
-    an environment at a different environment.
-
-    Key behaviours
-      - Change detection by LastWriteTime (UTC) with a configurable tolerance, optionally
-        combined with a file size comparison. No hashing.
-      - [INCLUDE] / [EXCLUDE] paths are relative to the source root and support wildcards.
-      - Files larger than MaxFileSizeMB are skipped with a WARNING, unless the file is
-        listed explicitly (as a file, not a folder) in [INCLUDE], in which case it is
-        copied and a WARNING is logged.
-      - Copies run in parallel through a throttled runspace pool.
-      - Retries on transient/network errors, no retry on access-denied or disk-full.
-      - One log file per day, automatic purge after LogRetentionDays.
-      - Lock file prevents overlapping executions.
-      - -WhatIf simulates everything without writing a single destination file.
+    Everything is configured in servers.ini, nothing is hardcoded here. Adding a server or
+    an exclusion pattern means editing the INI file only.
 
 .PARAMETER ConfigPath
-    Path to servers.ini. Default: E:\Data\se-iciq\se-deploy\servers.ini
+    Path to servers.ini.
 
 .PARAMETER RunOnce
-    Execute a single synchronization cycle and exit. Use this when the script is driven by
-    a Scheduled Task. Without it, the script loops forever, sleeping SyncIntervalMinutes
-    between cycles (the "runs continuously" model).
+    Runs one cycle and exits. Use this when the script is started by a Scheduled Task.
+    Without it the script keeps running and sleeps SyncIntervalMinutes between cycles.
 
 .PARAMETER LocalServerCode
-    Overrides hostname auto-detection. Mainly for testing and for hosts whose Windows
-    computer name does not match the INI entry.
-
-.PARAMETER MaxCycles
-    Safety valve for continuous mode / testing: stop after N cycles. 0 = unlimited.
+    Forces the local server code (D1, Q1, P3, ...) instead of detecting it from the computer
+    name. Needed for tests on a single machine, or if the computer name does not match the
+    INI file.
 
 .PARAMETER WhatIf
-    Simulates actions without copying files. Every action is logged with status WHATIF.
+    Simulates the run without copying anything. The log is still written.
 
 .EXAMPLE
     .\Sync-SeDeploy.ps1 -RunOnce -WhatIf
-    Dry run of one cycle on the local server.
 
 .EXAMPLE
-    .\Sync-SeDeploy.ps1 -ConfigPath 'E:\Data\se-iciq\se-deploy\servers.ini' -RunOnce
-    One real cycle, the form used by the Scheduled Task.
+    .\Sync-SeDeploy.ps1 -ConfigPath E:\Data\se-iciq\se-deploy\servers.ini -RunOnce
 
 .NOTES
-    Account       : callssp (requires READ on the source shares, READ+WRITE on the local
-                    destination tree - read on the destination is mandatory because the
-                    timestamp comparison has to stat the existing files).
-    Compatibility : Windows PowerShell 5.1 and PowerShell 7.x.
-    Version       : 1.0.0
+    Account : callssp (read on the source shares, read + write on the local destination
+              folder; read on the destination is needed for the timestamp comparison)
+    Written for Windows PowerShell 5.1, also works on PowerShell 7.
+    Version : 1.0
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
     [string]$ConfigPath = 'E:\Data\se-iciq\se-deploy\servers.ini',
     [switch]$RunOnce,
-    [string]$LocalServerCode,
-    [int]$MaxCycles = 0,
-    # Loads the functions without executing anything. Used by Test-SyncSeDeploy.ps1.
-    [switch]$LoadFunctionsOnly
+    [string]$LocalServerCode
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$Script:Sep = [System.IO.Path]::DirectorySeparatorChar
-$Script:LogFilePath = $null
+$Sep = [System.IO.Path]::DirectorySeparatorChar
+$Version = '1.0'
+
+# Filled in later, used by most functions
+$Script:LogFile = $null
 $Script:LogDate = $null
 $Script:LocalCode = $null
 $Script:Stats = $null
-$Script:ScriptVersion = '1.0.0'
 
-# ---------------------------------------------------------------------------
-# region INI parsing
-# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------- INI file --
 
 function Read-IniFile {
-    <#
-        Tolerant INI reader. Accepts [SECTION], (SECTION], [SECTION) - the requirement
-        document contained both typos, and a malformed bracket should not silently drop a
-        whole section. Sections hold either key=value pairs or bare list entries
-        (used by [INCLUDE] / [EXCLUDE]).
-    #>
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([string]$Path)
 
     if (-not (Test-Path -LiteralPath $Path)) {
         throw "Configuration file not found: $Path"
     }
 
-    $result = [ordered]@{}
-    $current = $null
-    $lineNo = 0
+    $ini = [ordered]@{}
+    $section = $null
 
     foreach ($rawLine in (Get-Content -LiteralPath $Path)) {
-        $lineNo++
+
         $line = $rawLine.Trim()
+        if ($line -eq '') { continue }
+        if ($line.StartsWith(';') -or $line.StartsWith('#')) { continue }
 
-        if ($line.Length -eq 0) { continue }
-        if ($line.StartsWith('#') -or $line.StartsWith(';')) { continue }
-
-        if ($line -match '^[\[\(]\s*([^\]\)]+?)\s*[\]\)]$') {
-            $current = $matches[1].ToUpperInvariant()
-            if (-not $result.Contains($current)) {
-                $result[$current] = [ordered]@{ Keys = [ordered]@{}; Items = New-Object System.Collections.ArrayList }
+        if ($line -match '^\[(.+)\]$') {
+            $section = $matches[1].Trim().ToUpper()
+            if (-not $ini.Contains($section)) {
+                $ini[$section] = [ordered]@{
+                    Keys  = [ordered]@{}
+                    Items = New-Object System.Collections.ArrayList
+                }
             }
             continue
         }
 
-        if ($null -eq $current) {
-            Write-Verbose "servers.ini line $lineNo ignored (outside of any section): $line"
-            continue
-        }
+        if ($null -eq $section) { continue }
 
-        $eq = $line.IndexOf('=')
-        if ($eq -gt 0) {
-            $key = $line.Substring(0, $eq).Trim()
-            $value = $line.Substring($eq + 1).Trim()
-            $result[$current].Keys[$key] = $value
-            [void]$result[$current].Items.Add($value)
+        # [INCLUDE] and [EXCLUDE] hold plain lines, the other sections hold key = value
+        $pos = $line.IndexOf('=')
+        if ($pos -gt 0) {
+            $ini[$section].Keys[$line.Substring(0, $pos).Trim()] = $line.Substring($pos + 1).Trim()
         }
         else {
-            [void]$result[$current].Items.Add($line)
+            [void]$ini[$section].Items.Add($line)
         }
     }
 
-    return $result
+    return $ini
 }
 
 function Get-IniValue {
-    param(
-        [Parameter(Mandatory = $true)]$Ini,
-        [Parameter(Mandatory = $true)][string]$Section,
-        [Parameter(Mandatory = $true)][string]$Key,
-        $Default = $null
-    )
-    $sec = $Section.ToUpperInvariant()
-    if ($Ini.Contains($sec) -and $Ini[$sec].Keys.Contains($Key)) {
-        $v = $Ini[$sec].Keys[$Key]
-        if (-not [string]::IsNullOrWhiteSpace($v)) { return $v }
+    param($Ini, [string]$Section, [string]$Key, $Default = $null)
+
+    $s = $Section.ToUpper()
+    if ($Ini.Contains($s) -and $Ini[$s].Keys.Contains($Key)) {
+        $value = $Ini[$s].Keys[$Key]
+        if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
     }
     return $Default
 }
 
 function Get-IniInt {
     param($Ini, [string]$Section, [string]$Key, [int]$Default)
-    $raw = Get-IniValue -Ini $Ini -Section $Section -Key $Key -Default $null
+
+    $raw = Get-IniValue $Ini $Section $Key
     if ($null -eq $raw) { return $Default }
-    $parsed = 0
-    if ([int]::TryParse(([string]$raw).Trim(), [ref]$parsed)) { return $parsed }
-    Write-Warning "servers.ini: [$Section] $Key = '$raw' is not a number, using default $Default"
+
+    $number = 0
+    if ([int]::TryParse(([string]$raw).Trim(), [ref]$number)) { return $number }
+
+    Write-Warning "servers.ini: [$Section] $Key = '$raw' is not a number, default $Default is used"
     return $Default
 }
 
-function Get-IniBool {
-    param($Ini, [string]$Section, [string]$Key, [bool]$Default)
-    $raw = Get-IniValue -Ini $Ini -Section $Section -Key $Key -Default $null
-    if ($null -eq $raw) { return $Default }
-    switch (([string]$raw).Trim().ToLowerInvariant()) {
-        'true'  { return $true }
-        '1'     { return $true }
-        'yes'   { return $true }
-        'y'     { return $true }
-        'false' { return $false }
-        '0'     { return $false }
-        'no'    { return $false }
-        'n'     { return $false }
-        default {
-            Write-Warning "servers.ini: [$Section] $Key = '$raw' is not a boolean, using default $Default"
-            return $Default
-        }
-    }
-}
 
-# ---------------------------------------------------------------------------
-# region Path helpers
-# ---------------------------------------------------------------------------
+# ------------------------------------------------------------------- paths --
 
 function ConvertTo-NativePath {
-    <# Normalizes separators so the same INI works on Windows (\) and during tests. #>
     param([string]$Path)
+
     if ([string]::IsNullOrWhiteSpace($Path)) { return $Path }
-    if ($Script:Sep -eq '\') { return ($Path -replace '/', '\') }
+    if ($Sep -eq '\') { return ($Path -replace '/', '\') }
     return ($Path -replace '\\', '/')
 }
 
 function Join-NativePath {
-    <# Joins a base path with a relative path expressed with either separator. #>
     param([string]$Base, [string]$Relative)
-    $out = $Base.TrimEnd('\', '/')
-    if ([string]::IsNullOrWhiteSpace($Relative)) { return $out }
+
+    $result = $Base.TrimEnd('\', '/')
+    if ([string]::IsNullOrWhiteSpace($Relative)) { return $result }
+
     foreach ($part in ($Relative -split '[\\/]+')) {
-        if ($part.Length -eq 0) { continue }
-        $out = $out + $Script:Sep + $part
+        if ($part -ne '') { $result = $result + $Sep + $part }
     }
-    return $out
+    return $result
 }
 
+# Path below $Root, always returned with backslashes (INI style and log style)
 function Get-RelativePath {
-    <# Returns the path below $Root, always expressed with backslashes (log/INI style). #>
     param([string]$FullPath, [string]$Root)
-    $rootNorm = $Root.TrimEnd('\', '/')
-    if ($FullPath.Length -le $rootNorm.Length) { return '' }
-    $rel = $FullPath.Substring($rootNorm.Length).TrimStart('\', '/')
-    return ($rel -replace '/', '\')
+
+    $root = $Root.TrimEnd('\', '/')
+    if ($FullPath.Length -le $root.Length) { return '' }
+    return (($FullPath.Substring($root.Length).TrimStart('\', '/')) -replace '/', '\')
 }
 
-# ---------------------------------------------------------------------------
-# region Logging
-# ---------------------------------------------------------------------------
+
+# ----------------------------------------------------------------- logging --
 
 function Format-FileSize {
     param([long]$Bytes)
+
     if ($Bytes -ge 1MB) { return ('{0:N1}MB' -f ($Bytes / 1MB)) }
     if ($Bytes -ge 1KB) { return ('{0:N1}KB' -f ($Bytes / 1KB)) }
-    return ('{0}B' -f $Bytes)
+    return "${Bytes}B"
 }
 
 function Initialize-LogFile {
-    param([Parameter(Mandatory = $true)]$Config)
+    param($Config)
 
     $today = (Get-Date).ToString('yyyy-MM-dd')
-    if ($Script:LogDate -eq $today -and $null -ne $Script:LogFilePath) { return }
+    if ($Script:LogDate -eq $today -and $null -ne $Script:LogFile) { return }
 
     if (-not (Test-Path -LiteralPath $Config.LogPath)) {
         New-Item -ItemType Directory -Path $Config.LogPath -Force | Out-Null
     }
+
     $Script:LogDate = $today
-    $Script:LogFilePath = Join-NativePath -Base $Config.LogPath -Relative ("se-deploy-sync_{0}.log" -f $today)
+    $Script:LogFile = Join-NativePath $Config.LogPath "se-deploy-sync_$today.log"
 }
 
 function Write-LogLine {
-    <# Single writer: only the main thread ever touches the log file. #>
-    param([Parameter(Mandatory = $true)][string]$Line)
+    param([string]$Line)
 
     Write-Verbose $Line
-    if ($null -eq $Script:LogFilePath) { return }
+    if ($null -eq $Script:LogFile) { return }
 
-    $attempt = 0
-    while ($true) {
+    # Only the main thread writes the log, but a virus scanner can still hold the file
+    for ($i = 1; $i -le 3; $i++) {
         try {
-            Add-Content -LiteralPath $Script:LogFilePath -Value $Line -Encoding UTF8 -ErrorAction Stop
+            Add-Content -LiteralPath $Script:LogFile -Value $Line -Encoding UTF8 -ErrorAction Stop
             return
         }
         catch {
-            $attempt++
-            if ($attempt -ge 3) {
-                Write-Warning "Unable to write to log file '$($Script:LogFilePath)': $($_.Exception.Message)"
+            if ($i -eq 3) {
+                Write-Warning "Cannot write to $($Script:LogFile): $($_.Exception.Message)"
                 return
             }
             Start-Sleep -Milliseconds 200
@@ -265,16 +211,12 @@ function Write-LogLine {
     }
 }
 
+# TIMESTAMP | SERVER | ACTION | SOURCE_FILE | DESTINATION_SERVERS | STATUS | SIZE | DURATION | ERROR
+# In a pull mechanism SERVER is the source server and DESTINATION_SERVERS is the local server.
 function Write-SyncLog {
-    <#
-        Structured record:
-        [TIMESTAMP] | [SERVER] | [ACTION] | [SOURCE_FILE] | [DESTINATION_SERVERS] | [STATUS] | [SIZE] | [DURATION] | [ERROR]
-        In a pull model SERVER is the source server the file came from and
-        DESTINATION_SERVERS is the local server doing the pull.
-    #>
     param(
         [string]$Server = 'SYSTEM',
-        [Parameter(Mandatory = $true)][string]$Action,
+        [string]$Action,
         [string]$SourceFile = '-',
         [string]$DestinationServers = '-',
         [string]$Status = '-',
@@ -283,71 +225,79 @@ function Write-SyncLog {
         [string]$ErrorText = '-'
     )
 
-    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    $err = $ErrorText
-    if ([string]::IsNullOrWhiteSpace($err)) { $err = '-' }
-    $err = ($err -replace '[\r\n]+', ' ').Trim()
+    if ([string]::IsNullOrWhiteSpace($ErrorText)) { $ErrorText = '-' }
+    $ErrorText = ($ErrorText -replace '[\r\n]+', ' ').Trim()
 
     Write-LogLine ('{0} | {1} | {2} | {3} | {4} | {5} | {6} | {7} | {8}' -f `
-            $ts, $Server, $Action, $SourceFile, $DestinationServers, $Status, $Size, $Duration, $err)
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $Server, $Action, $SourceFile,
+        $DestinationServers, $Status, $Size, $Duration, $ErrorText)
 }
 
-function Write-HeartbeatLog {
+function Write-Heartbeat {
     param([datetime]$NextRun)
-    $ts = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
-    Write-LogLine ('{0} | SYSTEM | HEARTBEAT | Script active | Next run: {1}' -f $ts, $NextRun.ToString('HH:mm:ss'))
+
+    Write-LogLine ('{0} | SYSTEM | HEARTBEAT | Script active | Next run: {1}' -f `
+        (Get-Date).ToString('yyyy-MM-dd HH:mm:ss'), $NextRun.ToString('HH:mm:ss'))
 }
 
-function Write-SummaryLog {
-    param([Parameter(Mandatory = $true)]$Stats, [string]$Timestamp)
+function Write-Summary {
+    param($Stats, [string]$Timestamp)
+
     if ([string]::IsNullOrWhiteSpace($Timestamp)) {
         $Timestamp = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
     }
-    $avg = 0
-    if ($Stats.Copied -gt 0) { $avg = [math]::Round($Stats.TotalDurationMs / $Stats.Copied) }
+
+    $average = 0
+    if ($Stats.Copied -gt 0) { $average = [math]::Round($Stats.TotalDurationMs / $Stats.Copied) }
+
     Write-LogLine ('{0} | SYSTEM | SUMMARY | Files copied: {1} | Errors: {2} | Warnings: {3} | Avg duration: {4}ms' -f `
-            $Timestamp, $Stats.Copied, $Stats.Errors, $Stats.Warnings, $avg)
+        $Timestamp, $Stats.Copied, $Stats.Errors, $Stats.Warnings, $average)
 }
 
-function New-StatsObject {
+function New-Stats {
     param([string]$Date)
+
     return [pscustomobject]@{
         Date            = $Date
         Copied          = 0
         Errors          = 0
         Warnings        = 0
-        Skipped         = 0
         TotalDurationMs = 0
     }
 }
 
-function Update-DailyStats {
-    <# Emits the daily summary when the date rolls over, then starts a fresh counter set. #>
-    param([Parameter(Mandatory = $true)]$Config)
+# Writes the daily summary when the date changes and starts new counters
+function Update-DayCounter {
+    param($Config)
 
     $today = (Get-Date).ToString('yyyy-MM-dd')
+
     if ($null -eq $Script:Stats) {
-        $Script:Stats = New-StatsObject -Date $today
+        $Script:Stats = New-Stats $today
         return
     }
+
     if ($Script:Stats.Date -ne $today) {
-        Write-SummaryLog -Stats $Script:Stats -Timestamp ("{0} 23:59:59" -f $Script:Stats.Date)
-        $Script:Stats = New-StatsObject -Date $today
-        Initialize-LogFile -Config $Config
-        Remove-OldLogFile -Config $Config
+        Write-Summary $Script:Stats "$($Script:Stats.Date) 23:59:59"
+        $Script:Stats = New-Stats $today
+        Initialize-LogFile $Config
+        Remove-OldLog $Config
     }
 }
 
-function Remove-OldLogFile {
-    param([Parameter(Mandatory = $true)]$Config)
+function Remove-OldLog {
+    param($Config)
+
     try {
-        # Keep LogRetentionDays files in total, today's log included.
-        $cutoff = (Get-Date).Date.AddDays(-1 * ($Config.LogRetentionDays - 1))
-        $old = Get-ChildItem -LiteralPath $Config.LogPath -Filter 'se-deploy-sync_*.log' -File -ErrorAction Stop |
-            Where-Object { $_.LastWriteTime -lt $cutoff }
-        foreach ($f in $old) {
-            Remove-Item -LiteralPath $f.FullName -Force -ErrorAction Stop
-            Write-SyncLog -Action 'LOG_PURGE' -SourceFile $f.Name -Status 'SUCCESS'
+        # LogRetentionDays files in total, today included
+        $limit = (Get-Date).Date.AddDays(-1 * ($Config.LogRetentionDays - 1))
+
+        $oldFiles = Get-ChildItem -LiteralPath $Config.LogPath -Filter 'se-deploy-sync_*.log' -File |
+            Where-Object { $_.LastWriteTime -lt $limit }
+
+        foreach ($file in $oldFiles) {
+            Remove-Item -LiteralPath $file.FullName -Force
+            Write-SyncLog -Action 'LOG_PURGE' -SourceFile $file.Name -Status 'SUCCESS'
         }
     }
     catch {
@@ -355,616 +305,580 @@ function Remove-OldLogFile {
     }
 }
 
-# ---------------------------------------------------------------------------
-# region Configuration
-# ---------------------------------------------------------------------------
+
+# ----------------------------------------------------------- configuration --
 
 function Get-SyncConfiguration {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([string]$Path)
 
-    $ini = Read-IniFile -Path $Path
+    $ini = Read-IniFile $Path
 
-    $cfg = [ordered]@{
+    $config = [ordered]@{
         ConfigPath                = $Path
         BasePath                  = ConvertTo-NativePath (Get-IniValue $ini 'GLOBAL' 'BasePath' 'E:\Data\se-iciq\')
         DestinationBasePath       = ConvertTo-NativePath (Get-IniValue $ini 'GLOBAL' 'DestinationBasePath' 'E:\Data\se-iciq\se-deploy\')
         LogPath                   = ConvertTo-NativePath (Get-IniValue $ini 'GLOBAL' 'LogPath' 'E:\Data\se-iciq\se-deploy\Logs\')
-        LockFilePath              = ConvertTo-NativePath (Get-IniValue $ini 'GLOBAL' 'LockFilePath' '')
         SourceRootTemplate        = Get-IniValue $ini 'GLOBAL' 'SourceRootTemplate' '{SERVER}\E$\Data\se-iciq'
-        LogRetentionDays          = Get-IniInt  $ini 'GLOBAL' 'LogRetentionDays' 7
-        SyncIntervalMinutes       = Get-IniInt  $ini 'GLOBAL' 'SyncIntervalMinutes' 10
-        MaxFileSizeMB             = Get-IniInt  $ini 'GLOBAL' 'MaxFileSizeMB' 100
-        MaxConcurrentCopies       = Get-IniInt  $ini 'GLOBAL' 'MaxConcurrentCopies' 4
-        RetryCount                = Get-IniInt  $ini 'GLOBAL' 'RetryCount' 3
-        RetryDelaySeconds         = Get-IniInt  $ini 'GLOBAL' 'RetryDelaySeconds' 5
-        MinFreeSpaceMB            = Get-IniInt  $ini 'GLOBAL' 'MinFreeSpaceMB' 1024
-        LockTimeoutMinutes        = Get-IniInt  $ini 'GLOBAL' 'LockTimeoutMinutes' 60
-        TimestampToleranceSeconds = Get-IniInt  $ini 'GLOBAL' 'TimestampToleranceSeconds' 2
-        DiskFullPauseMinutes      = Get-IniInt  $ini 'GLOBAL' 'DiskFullPauseMinutes' 30
-        CompareFileSize           = Get-IniBool $ini 'GLOBAL' 'CompareFileSize' $true
-        PreserveTimestamps        = Get-IniBool $ini 'GLOBAL' 'PreserveTimestamps' $true
-        MatchExcludeAtAnyDepth    = Get-IniBool $ini 'GLOBAL' 'MatchExcludeAtAnyDepth' $true
-        WarnOnMissingIncludePath  = Get-IniBool $ini 'GLOBAL' 'WarnOnMissingIncludePath' $true
+        LogRetentionDays          = Get-IniInt $ini 'GLOBAL' 'LogRetentionDays' 7
+        SyncIntervalMinutes       = Get-IniInt $ini 'GLOBAL' 'SyncIntervalMinutes' 10
+        MaxFileSizeMB             = Get-IniInt $ini 'GLOBAL' 'MaxFileSizeMB' 100
+        MaxConcurrentCopies       = Get-IniInt $ini 'GLOBAL' 'MaxConcurrentCopies' 4
+        RetryCount                = Get-IniInt $ini 'GLOBAL' 'RetryCount' 3
+        RetryDelaySeconds         = Get-IniInt $ini 'GLOBAL' 'RetryDelaySeconds' 5
+        MinFreeSpaceMB            = Get-IniInt $ini 'GLOBAL' 'MinFreeSpaceMB' 1024
+        LockTimeoutMinutes        = Get-IniInt $ini 'GLOBAL' 'LockTimeoutMinutes' 60
+        TimestampToleranceSeconds = Get-IniInt $ini 'GLOBAL' 'TimestampToleranceSeconds' 2
         Environments              = [ordered]@{}
         ServerEnvironment         = @{}
         ServerHost                = [ordered]@{}
-        SourceRootOverrides       = @{}
+        SourceRootPerEnvironment  = @{}
         Mapping                   = @{}
         Include                   = New-Object System.Collections.ArrayList
         Exclude                   = New-Object System.Collections.ArrayList
-        Clusters                  = [ordered]@{}
     }
 
-    # --- environments and their servers -------------------------------------
-    foreach ($envName in @('DEV', 'QA', 'PROD')) {
+    foreach ($environment in @('DEV', 'QA', 'PROD')) {
         $servers = [ordered]@{}
-        if ($ini.Contains($envName)) {
-            foreach ($k in $ini[$envName].Keys.Keys) {
-                $code = $k.Trim().ToUpperInvariant()
-                $servers[$code] = $ini[$envName].Keys[$k].Trim()
-                $cfg.ServerEnvironment[$code] = $envName
-                $cfg.ServerHost[$code] = $ini[$envName].Keys[$k].Trim()
+        if ($ini.Contains($environment)) {
+            foreach ($key in $ini[$environment].Keys.Keys) {
+                $code = $key.Trim().ToUpper()
+                $servers[$code] = $ini[$environment].Keys[$key].Trim()
+                $config.ServerEnvironment[$code] = $environment
+                $config.ServerHost[$code] = $ini[$environment].Keys[$key].Trim()
             }
         }
-        $cfg.Environments[$envName] = $servers
+        $config.Environments[$environment] = $servers
     }
 
-    # --- environment mapping (destination env -> source env) ----------------
-    $defaultMapping = @{ 'QA' = 'DEV'; 'PROD' = 'QA' }
+    # destination environment = source environment
+    $config.Mapping['QA'] = 'DEV'
+    $config.Mapping['PROD'] = 'QA'
     if ($ini.Contains('MAPPING')) {
-        foreach ($k in $ini['MAPPING'].Keys.Keys) {
-            $cfg.Mapping[$k.Trim().ToUpperInvariant()] = $ini['MAPPING'].Keys[$k].Trim().ToUpperInvariant()
-        }
-    }
-    foreach ($k in $defaultMapping.Keys) {
-        if (-not $cfg.Mapping.ContainsKey($k)) { $cfg.Mapping[$k] = $defaultMapping[$k] }
-    }
-    # Guard: an environment may never be its own source.
-    foreach ($k in @($cfg.Mapping.Keys)) {
-        if ($cfg.Mapping[$k] -eq $k) {
-            throw "servers.ini [MAPPING]: '$k = $k' would synchronize an environment with itself, which is forbidden."
+        foreach ($key in $ini['MAPPING'].Keys.Keys) {
+            $config.Mapping[$key.Trim().ToUpper()] = $ini['MAPPING'].Keys[$key].Trim().ToUpper()
         }
     }
 
-    # --- optional per-source-environment root overrides ---------------------
+    # DEV to DEV, QA to QA and PROD to PROD must never happen
+    foreach ($key in @($config.Mapping.Keys)) {
+        if ($config.Mapping[$key] -eq $key) {
+            throw "servers.ini [MAPPING]: '$key = $key' would synchronize an environment with itself."
+        }
+    }
+
     if ($ini.Contains('SOURCEROOT')) {
-        foreach ($k in $ini['SOURCEROOT'].Keys.Keys) {
-            $cfg.SourceRootOverrides[$k.Trim().ToUpperInvariant()] = $ini['SOURCEROOT'].Keys[$k].Trim()
+        foreach ($key in $ini['SOURCEROOT'].Keys.Keys) {
+            $config.SourceRootPerEnvironment[$key.Trim().ToUpper()] = $ini['SOURCEROOT'].Keys[$key].Trim()
         }
     }
 
-    # --- include / exclude ---------------------------------------------------
-    foreach ($sec in @('INCLUDE', 'EXCLUDE')) {
-        if (-not $ini.Contains($sec)) { continue }
-        foreach ($item in $ini[$sec].Items) {
-            $v = ([string]$item).Trim()
-            if ($v.Length -eq 0) { continue }
-            if ($sec -eq 'INCLUDE') { [void]$cfg.Include.Add($v) } else { [void]$cfg.Exclude.Add($v) }
+    foreach ($section in @('INCLUDE', 'EXCLUDE')) {
+        if (-not $ini.Contains($section)) { continue }
+        foreach ($item in $ini[$section].Items) {
+            $value = ([string]$item).Trim()
+            if ($value -eq '') { continue }
+            if ($section -eq 'INCLUDE') { [void]$config.Include.Add($value) }
+            else { [void]$config.Exclude.Add($value) }
         }
     }
 
-    # --- clusters (informational only) --------------------------------------
-    if ($ini.Contains('CLUSTERS')) {
-        foreach ($k in $ini['CLUSTERS'].Keys.Keys) {
-            $cfg.Clusters[$k.Trim()] = ($ini['CLUSTERS'].Keys[$k] -split '[,;]' | ForEach-Object { $_.Trim().ToUpperInvariant() } | Where-Object { $_ })
-        }
+    if ($config.Include.Count -eq 0) {
+        throw 'servers.ini: [INCLUDE] is empty, nothing would be synchronized.'
     }
 
-    if ($cfg.Include.Count -eq 0) {
-        throw "servers.ini: [INCLUDE] is empty - nothing would ever be synchronized."
-    }
-    if ($cfg.MaxConcurrentCopies -lt 1) { $cfg.MaxConcurrentCopies = 1 }
-    if ($cfg.RetryCount -lt 1) { $cfg.RetryCount = 1 }
-    if ($cfg.SyncIntervalMinutes -lt 1) { $cfg.SyncIntervalMinutes = 1 }
+    if ($config.MaxConcurrentCopies -lt 1) { $config.MaxConcurrentCopies = 1 }
+    if ($config.RetryCount -lt 1) { $config.RetryCount = 1 }
+    if ($config.SyncIntervalMinutes -lt 1) { $config.SyncIntervalMinutes = 1 }
 
-    if ([string]::IsNullOrWhiteSpace($cfg.LockFilePath)) {
-        $cfg.LockFilePath = Join-NativePath -Base $cfg.DestinationBasePath -Relative 'se-deploy-sync.lock'
-    }
+    $config.LockFile = Join-NativePath $config.DestinationBasePath 'se-deploy-sync.lock'
 
-    return [pscustomobject]$cfg
+    return [pscustomobject]$config
 }
 
 function Resolve-LocalServerCode {
-    <# Matches the local computer name against the host values in the INI. #>
-    param([Parameter(Mandatory = $true)]$Config, [string]$Override)
+    param($Config, [string]$Override)
 
     if (-not [string]::IsNullOrWhiteSpace($Override)) {
-        $code = $Override.Trim().ToUpperInvariant()
+        $code = $Override.Trim().ToUpper()
         if (-not $Config.ServerEnvironment.ContainsKey($code)) {
-            throw "Server code '$code' is not defined in any of the [DEV]/[QA]/[PROD] sections of $($Config.ConfigPath)."
+            throw "Server code '$code' is not defined in the [DEV], [QA] or [PROD] section of $($Config.ConfigPath)."
         }
         return $code
     }
 
-    $names = New-Object System.Collections.ArrayList
-    if ($env:COMPUTERNAME) { [void]$names.Add($env:COMPUTERNAME) }
-    try { [void]$names.Add([System.Net.Dns]::GetHostName()) } catch { }
-    try { [void]$names.Add([System.Net.Dns]::GetHostEntry('').HostName) } catch { }
+    $localNames = New-Object System.Collections.ArrayList
+    if ($env:COMPUTERNAME) { [void]$localNames.Add($env:COMPUTERNAME) }
+    try { [void]$localNames.Add([System.Net.Dns]::GetHostName()) } catch { }
 
     foreach ($code in $Config.ServerHost.Keys) {
-        $hostValue = $Config.ServerHost[$code].TrimStart('\', '/')
-        $shortHost = ($hostValue -split '\.')[0]
-        foreach ($n in $names) {
-            if ([string]::IsNullOrWhiteSpace($n)) { continue }
-            $shortLocal = ($n -split '\.')[0]
-            if ($shortLocal -eq $shortHost -or $n -eq $hostValue) { return $code }
+        $iniHost = $Config.ServerHost[$code].TrimStart('\', '/')
+        $iniShortName = ($iniHost -split '\.')[0]
+
+        foreach ($name in $localNames) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            if (($name -split '\.')[0] -eq $iniShortName -or $name -eq $iniHost) { return $code }
         }
     }
 
-    $msg = "This computer ({0}) does not match any server defined in {1}. " -f ($names -join ', '), $Config.ConfigPath
-    $msg += "Add it to the INI or start the script with -LocalServerCode."
-    throw $msg
+    throw ("This computer ($($localNames -join ', ')) is not defined in $($Config.ConfigPath). " +
+           "Add it to the INI file or start the script with -LocalServerCode.")
 }
 
+# \\SYQDDWHDEV1.res.sys.shared.fortis + template -> \\SYQDDWHDEV1.res.sys.shared.fortis\E$\Data\se-iciq
 function Get-SourceRoot {
-    <# Builds the source root for a given server code, e.g. \\HOST\E$\Data\se-iciq #>
-    param([Parameter(Mandatory = $true)]$Config, [Parameter(Mandatory = $true)][string]$ServerCode)
+    param($Config, [string]$ServerCode)
 
-    $envName = $Config.ServerEnvironment[$ServerCode]
+    $environment = $Config.ServerEnvironment[$ServerCode]
+
     $template = $Config.SourceRootTemplate
-    if ($Config.SourceRootOverrides.ContainsKey($envName)) {
-        $template = $Config.SourceRootOverrides[$envName]
+    if ($Config.SourceRootPerEnvironment.ContainsKey($environment)) {
+        $template = $Config.SourceRootPerEnvironment[$environment]
     }
-    $hostValue = $Config.ServerHost[$ServerCode]
-    $root = $template.Replace('{SERVER}', $hostValue).Replace('{CODE}', $ServerCode)
-    return (ConvertTo-NativePath $root).TrimEnd('\', '/')
+
+    return (ConvertTo-NativePath $template.Replace('{SERVER}', $Config.ServerHost[$ServerCode])).TrimEnd('\', '/')
 }
 
-# ---------------------------------------------------------------------------
-# region Include / exclude rules
-# ---------------------------------------------------------------------------
 
+# ------------------------------------------------------- include / exclude --
+
+<#
+    Patterns are relative to the source root:
+        Se-common\bat\Recov_Temp\   the folder and everything below it
+        Se-common\bat\CFT_ACK.log   this file only
+        *.tmp                       file name, at any level
+        temp\*                      a folder named temp, at any level
+#>
 function Test-FileExclusion {
-    <#
-        Decides whether a path relative to the source root must be skipped.
-        Pattern semantics:
-          "Se-common\bat\Recov_Temp\"  trailing separator -> the folder and everything below it
-          "Se-common\bat\CFT_ACK.log"  contains a separator -> matched against the whole
-                                       relative path (wildcards allowed, * spans separators)
-          "*.tmp"                      no separator -> matched against the file name alone
-        MatchExcludeAtAnyDepth also matches multi-segment patterns further down the tree
-        (so "temp\*" catches "Se-common\temp\x.log" as well).
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$RelativePath,
-        [Parameter(Mandatory = $true)]$Patterns,
-        [bool]$MatchAtAnyDepth = $true
-    )
+    param([string]$RelativePath, $Patterns)
 
-    $rel = ($RelativePath -replace '/', '\').TrimStart('\')
-    if ($rel.Length -eq 0) { return $false }
-    $leaf = ($rel -split '\\')[-1]
+    $path = ($RelativePath -replace '/', '\').TrimStart('\')
+    if ($path -eq '') { return $false }
+    $fileName = ($path -split '\\')[-1]
 
     foreach ($rawPattern in $Patterns) {
-        $p = ([string]$rawPattern).Trim()
-        if ($p.Length -eq 0) { continue }
-        $p = ($p -replace '/', '\').TrimStart('\')
 
-        if ($p.EndsWith('\')) {
-            $prefix = $p.TrimEnd('\')
-            if ($rel -like ($prefix + '\*')) { return $true }
-            if ($rel -eq $prefix) { return $true }
-            if ($MatchAtAnyDepth -and ($rel -like ('*\' + $prefix + '\*'))) { return $true }
+        $pattern = ([string]$rawPattern).Trim()
+        if ($pattern -eq '') { continue }
+        $pattern = ($pattern -replace '/', '\').TrimStart('\')
+
+        if ($pattern.EndsWith('\')) {
+            $folder = $pattern.TrimEnd('\')
+            if ($path -eq $folder) { return $true }
+            if ($path -like "$folder\*") { return $true }
+            if ($path -like "*\$folder\*") { return $true }
             continue
         }
 
-        if ($p.Contains('\')) {
-            if ($rel -like $p) { return $true }
-            if ($rel -like ($p + '\*')) { return $true }
-            if ($MatchAtAnyDepth) {
-                if ($rel -like ('*\' + $p)) { return $true }
-                if ($rel -like ('*\' + $p + '\*')) { return $true }
-            }
+        if ($pattern.Contains('\')) {
+            if ($path -like $pattern) { return $true }
+            if ($path -like "$pattern\*") { return $true }
+            if ($path -like "*\$pattern") { return $true }
+            if ($path -like "*\$pattern\*") { return $true }
             continue
         }
 
-        if ($leaf -like $p) { return $true }
+        if ($fileName -like $pattern) { return $true }
     }
 
     return $false
 }
 
-function Get-IncludeTarget {
-    <#
-        Expands one [INCLUDE] entry into the files it designates on a given source root.
-        A trailing separator, or a path that resolves to a directory, means "recurse".
-        Anything else is treated as a single explicitly listed file.
-    #>
-    param(
-        [Parameter(Mandatory = $true)][string]$SourceRoot,
-        [Parameter(Mandatory = $true)][string]$Entry
-    )
+# One [INCLUDE] entry -> the files it points to on one source server
+function Get-IncludeContent {
+    param([string]$SourceRoot, [string]$Entry)
 
-    $isFolderEntry = $Entry.EndsWith('\') -or $Entry.EndsWith('/')
-    $rel = $Entry.TrimEnd('\', '/')
-    $full = Join-NativePath -Base $SourceRoot -Relative $rel
+    $relative = $Entry.TrimEnd('\', '/')
+    $fullPath = Join-NativePath $SourceRoot $relative
 
-    $out = [pscustomobject]@{
-        Entry          = $Entry
-        RelativeRoot   = ($rel -replace '/', '\')
-        Exists         = $false
-        IsExplicitFile = $false
-        Files          = @()
-        ErrorText      = $null
+    $result = [pscustomobject]@{
+        Entry     = $Entry
+        Exists    = $false
+        SingleFile = $false   # entry without trailing backslash = one file listed by name
+        Files     = @()
+        ErrorText = $null
     }
 
     try {
-        if (-not (Test-Path -LiteralPath $full)) { return $out }
-        $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
-        $out.Exists = $true
+        if (-not (Test-Path -LiteralPath $fullPath)) { return $result }
+
+        $item = Get-Item -LiteralPath $fullPath -Force
+        $result.Exists = $true
 
         if ($item.PSIsContainer) {
-            $out.Files = @(Get-ChildItem -LiteralPath $full -File -Recurse -Force -ErrorAction Stop)
+            $result.Files = @(Get-ChildItem -LiteralPath $fullPath -File -Recurse -Force)
         }
         else {
-            if ($isFolderEntry) {
-                $out.ErrorText = "INCLUDE entry '$Entry' ends with a separator but is a file on this source."
-            }
-            $out.IsExplicitFile = $true
-            $out.Files = @($item)
+            $result.SingleFile = $true
+            $result.Files = @($item)
         }
     }
     catch {
-        $out.ErrorText = $_.Exception.Message
+        $result.ErrorText = $_.Exception.Message
     }
 
-    return $out
+    return $result
 }
 
-# ---------------------------------------------------------------------------
-# region Lock file
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------- lock file --
 
 function Enter-SyncLock {
-    param([Parameter(Mandatory = $true)]$Config)
+    param($Config)
 
-    $lockPath = $Config.LockFilePath
-    $dir = Split-Path -Parent $lockPath
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) {
-        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    $lockFile = $Config.LockFile
+    $folder = Split-Path -Parent $lockFile
+    if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+        New-Item -ItemType Directory -Path $folder -Force | Out-Null
     }
 
-    if (Test-Path -LiteralPath $lockPath) {
-        $stale = $false
+    if (Test-Path -LiteralPath $lockFile) {
+
+        $isStale = $false
         $reason = ''
+
         try {
-            $content = Get-Content -LiteralPath $lockPath -Raw -ErrorAction Stop
+            $content = Get-Content -LiteralPath $lockFile -Raw
+
             $lockPid = $null
-            $lockTime = $null
             if ($content -match 'PID=(\d+)') { $lockPid = [int]$matches[1] }
+
+            $lockTime = $null
             if ($content -match 'Started=([0-9\-: ]+)') {
                 $parsed = [datetime]::MinValue
                 if ([datetime]::TryParse($matches[1].Trim(), [ref]$parsed)) { $lockTime = $parsed }
             }
 
-            if ($null -ne $lockPid) {
-                $proc = Get-Process -Id $lockPid -ErrorAction SilentlyContinue
-                if ($null -eq $proc) {
-                    $stale = $true
-                    $reason = "owning process $lockPid is gone"
-                }
+            if ($null -ne $lockPid -and $null -eq (Get-Process -Id $lockPid -ErrorAction SilentlyContinue)) {
+                $isStale = $true
+                $reason = "process $lockPid does not exist anymore"
             }
-            if (-not $stale -and $null -ne $lockTime -and
-                ((Get-Date) - $lockTime).TotalMinutes -gt $Config.LockTimeoutMinutes) {
-                $stale = $true
+            elseif ($null -ne $lockTime -and ((Get-Date) - $lockTime).TotalMinutes -gt $Config.LockTimeoutMinutes) {
+                $isStale = $true
                 $reason = "lock older than $($Config.LockTimeoutMinutes) minutes"
             }
         }
         catch {
-            $stale = $true
-            $reason = "lock file unreadable"
+            $isStale = $true
+            $reason = 'lock file not readable'
         }
 
-        if (-not $stale) {
-            return $false
-        }
+        if (-not $isStale) { return $false }
 
-        Write-SyncLog -Action 'LOCK' -SourceFile $lockPath -Status 'WARNING' -ErrorText "Stale lock removed ($reason)"
-        Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+        Write-SyncLog -Action 'LOCK' -SourceFile $lockFile -Status 'WARNING' -ErrorText "Stale lock removed ($reason)"
+        Remove-Item -LiteralPath $lockFile -Force -ErrorAction SilentlyContinue
     }
 
-    $payload = "PID=$PID`r`nStarted=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))`r`nServer=$($Script:LocalCode)"
-    Set-Content -LiteralPath $lockPath -Value $payload -Encoding UTF8 -ErrorAction Stop
+    Set-Content -LiteralPath $lockFile -Encoding UTF8 -Value @"
+PID=$PID
+Started=$((Get-Date).ToString('yyyy-MM-dd HH:mm:ss'))
+Server=$($Script:LocalCode)
+"@
+
     return $true
 }
 
 function Exit-SyncLock {
-    param([Parameter(Mandatory = $true)]$Config)
+    param($Config)
+
     try {
-        if (Test-Path -LiteralPath $Config.LockFilePath) {
-            Remove-Item -LiteralPath $Config.LockFilePath -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $Config.LockFile) {
+            Remove-Item -LiteralPath $Config.LockFile -Force
         }
     }
     catch {
-        Write-SyncLog -Action 'LOCK' -Status 'WARNING' -ErrorText "Unable to remove lock file: $($_.Exception.Message)"
+        Write-SyncLog -Action 'LOCK' -Status 'WARNING' -ErrorText "Cannot delete the lock file: $($_.Exception.Message)"
     }
 }
 
-# ---------------------------------------------------------------------------
-# region Free space
-# ---------------------------------------------------------------------------
+
+# --------------------------------------------------------------- free space --
 
 function Get-FreeSpaceMB {
-    param([Parameter(Mandatory = $true)][string]$Path)
+    param([string]$Path)
+
     try {
-        $probe = $Path
-        while ($probe -and -not (Test-Path -LiteralPath $probe)) {
-            $parent = Split-Path -Parent $probe
-            if ($parent -eq $probe) { break }
-            $probe = $parent
+        # the destination folder may not exist yet, go up until we find something
+        $existing = $Path
+        while ($existing -and -not (Test-Path -LiteralPath $existing)) {
+            $parent = Split-Path -Parent $existing
+            if ($parent -eq $existing) { break }
+            $existing = $parent
         }
-        if (-not $probe) { return -1 }
-        $full = (Resolve-Path -LiteralPath $probe -ErrorAction Stop).Path
-        $root = [System.IO.Path]::GetPathRoot($full)
+        if (-not $existing) { return -1 }
+
+        $root = [System.IO.Path]::GetPathRoot((Resolve-Path -LiteralPath $existing).Path)
         if ([string]::IsNullOrWhiteSpace($root)) { return -1 }
-        $drive = New-Object System.IO.DriveInfo($root)
-        return [math]::Round($drive.AvailableFreeSpace / 1MB)
+
+        return [math]::Round((New-Object System.IO.DriveInfo($root)).AvailableFreeSpace / 1MB)
     }
     catch {
         return -1
     }
 }
 
-# ---------------------------------------------------------------------------
-# region Planning
-# ---------------------------------------------------------------------------
 
-function New-CopyPlan {
-    <#
-        Walks every source server of the source environment and returns the list of files
-        that must be copied, plus the skip/warning decisions taken along the way.
-    #>
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)][string[]]$SourceServers,
-        [Parameter(Mandatory = $true)][bool]$Simulate
-    )
+# ------------------------------------------------------------------- files --
 
-    $plan = New-Object System.Collections.ArrayList
+# Builds the list of files to copy for all source servers
+function Get-FilesToCopy {
+    param($Config, [string[]]$SourceServers, [bool]$Simulate)
+
+    $filesToCopy = New-Object System.Collections.ArrayList
     $maxBytes = [long]$Config.MaxFileSizeMB * 1MB
-    $tolerance = [double]$Config.TimestampToleranceSeconds
 
-    foreach ($srcCode in $SourceServers) {
-        $sourceRoot = Get-SourceRoot -Config $Config -ServerCode $srcCode
-        $destRoot = Join-NativePath -Base $Config.DestinationBasePath -Relative $srcCode
+    foreach ($sourceCode in $SourceServers) {
+
+        $sourceRoot = Get-SourceRoot $Config $sourceCode
+        $destinationRoot = Join-NativePath $Config.DestinationBasePath $sourceCode
 
         if (-not (Test-Path -LiteralPath $sourceRoot)) {
-            Write-SyncLog -Server $srcCode -Action 'SCAN' -SourceFile $sourceRoot -DestinationServers $Script:LocalCode `
-                -Status 'FAIL' -ErrorText 'Source root unreachable (network, share or permissions)'
+            Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $sourceRoot `
+                -DestinationServers $Script:LocalCode -Status 'FAIL' `
+                -ErrorText 'Source folder not reachable (network, share or permissions)'
             $Script:Stats.Errors++
             continue
         }
 
         foreach ($entry in $Config.Include) {
-            $target = Get-IncludeTarget -SourceRoot $sourceRoot -Entry $entry
 
-            if ($null -ne $target.ErrorText) {
-                Write-SyncLog -Server $srcCode -Action 'SCAN' -SourceFile $entry -DestinationServers $Script:LocalCode `
-                    -Status 'WARNING' -ErrorText $target.ErrorText
+            $include = Get-IncludeContent $sourceRoot $entry
+
+            if ($null -ne $include.ErrorText) {
+                Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $entry `
+                    -DestinationServers $Script:LocalCode -Status 'WARNING' -ErrorText $include.ErrorText
                 $Script:Stats.Warnings++
             }
-            if (-not $target.Exists) {
-                # An INCLUDE folder that does not exist on every source server is normal in some
-                # setups; set WarnOnMissingIncludePath = False to keep the log quiet.
-                if ($Config.WarnOnMissingIncludePath) {
-                    Write-SyncLog -Server $srcCode -Action 'SCAN' -SourceFile $entry -DestinationServers $Script:LocalCode `
-                        -Status 'WARNING' -ErrorText 'INCLUDE path not found on source'
-                    $Script:Stats.Warnings++
-                }
+
+            if (-not $include.Exists) {
+                Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $entry `
+                    -DestinationServers $Script:LocalCode -Status 'WARNING' `
+                    -ErrorText 'INCLUDE path does not exist on the source server'
+                $Script:Stats.Warnings++
                 continue
             }
 
-            foreach ($file in $target.Files) {
-                $rel = Get-RelativePath -FullPath $file.FullName -Root $sourceRoot
-                if ($rel.Length -eq 0) { continue }
+            foreach ($file in $include.Files) {
 
-                if (Test-FileExclusion -RelativePath $rel -Patterns $Config.Exclude -MatchAtAnyDepth $Config.MatchExcludeAtAnyDepth) {
-                    Write-Verbose "EXCLUDED $srcCode :: $rel"
+                $relativePath = Get-RelativePath $file.FullName $sourceRoot
+                if ($relativePath -eq '') { continue }
+
+                if (Test-FileExclusion $relativePath $Config.Exclude) {
+                    Write-Verbose "Excluded: $sourceCode $relativePath"
                     continue
                 }
 
-                $destPath = Join-NativePath -Base $destRoot -Relative $rel
-                $destFile = $null
-                if (Test-Path -LiteralPath $destPath) {
-                    try { $destFile = Get-Item -LiteralPath $destPath -Force -ErrorAction Stop } catch { $destFile = $null }
+                $destinationPath = Join-NativePath $destinationRoot $relativePath
+
+                $destinationFile = $null
+                if (Test-Path -LiteralPath $destinationPath) {
+                    try { $destinationFile = Get-Item -LiteralPath $destinationPath -Force } catch { }
                 }
 
-                # --- change detection -----------------------------------------
-                $needsCopy = $false
-                if ($null -eq $destFile) {
-                    $needsCopy = $true
+                # new file, newer file, or same timestamp but different size
+                $copyNeeded = $false
+                if ($null -eq $destinationFile) {
+                    $copyNeeded = $true
                 }
-                else {
-                    $delta = ($file.LastWriteTimeUtc - $destFile.LastWriteTimeUtc).TotalSeconds
-                    if ($delta -gt $tolerance) { $needsCopy = $true }
-                    elseif ($Config.CompareFileSize -and $file.Length -ne $destFile.Length) { $needsCopy = $true }
+                elseif (($file.LastWriteTimeUtc - $destinationFile.LastWriteTimeUtc).TotalSeconds -gt $Config.TimestampToleranceSeconds) {
+                    $copyNeeded = $true
                 }
-                if (-not $needsCopy) { continue }
+                elseif ($file.Length -ne $destinationFile.Length) {
+                    $copyNeeded = $true
+                }
 
-                # --- size guard -----------------------------------------------
+                if (-not $copyNeeded) { continue }
+
+                # too big files are skipped, except when the INI lists the file by name
                 $sizeWarning = $null
                 if ($file.Length -gt $maxBytes) {
-                    if (-not $target.IsExplicitFile) {
-                        Write-SyncLog -Server $srcCode -Action 'SKIP' -SourceFile $rel -DestinationServers $Script:LocalCode `
-                            -Status 'WARNING' -Size (Format-FileSize $file.Length) `
-                            -ErrorText "File exceeds MaxFileSizeMB ($($Config.MaxFileSizeMB)MB)"
+                    if (-not $include.SingleFile) {
+                        Write-SyncLog -Server $sourceCode -Action 'SKIP' -SourceFile $relativePath `
+                            -DestinationServers $Script:LocalCode -Status 'WARNING' `
+                            -Size (Format-FileSize $file.Length) `
+                            -ErrorText "File bigger than MaxFileSizeMB ($($Config.MaxFileSizeMB)MB)"
                         $Script:Stats.Warnings++
-                        $Script:Stats.Skipped++
                         continue
                     }
-                    $sizeWarning = "File exceeds MaxFileSizeMB ($($Config.MaxFileSizeMB)MB) but is listed explicitly in [INCLUDE]"
+                    $sizeWarning = "File bigger than MaxFileSizeMB ($($Config.MaxFileSizeMB)MB) but listed in [INCLUDE]"
                 }
 
-                [void]$plan.Add([pscustomobject]@{
-                        SourceCode        = $srcCode
-                        RelativePath      = $rel
-                        SourcePath        = $file.FullName
-                        DestinationPath   = $destPath
-                        SizeBytes         = [long]$file.Length
-                        SourceLastWriteUtc = $file.LastWriteTimeUtc
-                        SizeWarning       = $sizeWarning
-                        MaxAttempts       = $Config.RetryCount
-                        RetryDelaySeconds = $Config.RetryDelaySeconds
-                        PreserveTimestamps = $Config.PreserveTimestamps
-                        Simulate          = $Simulate
-                    })
+                [void]$filesToCopy.Add([pscustomobject]@{
+                    SourceCode        = $sourceCode
+                    RelativePath      = $relativePath
+                    SourcePath        = $file.FullName
+                    DestinationPath   = $destinationPath
+                    SizeBytes         = [long]$file.Length
+                    LastWriteUtc      = $file.LastWriteTimeUtc
+                    SizeWarning       = $sizeWarning
+                    MaxAttempts       = $Config.RetryCount
+                    RetryDelaySeconds = $Config.RetryDelaySeconds
+                    Simulate          = $Simulate
+                })
             }
         }
     }
 
-    return $plan
+    return $filesToCopy
 }
 
-# ---------------------------------------------------------------------------
-# region Copy worker (runs inside the runspace pool)
-# ---------------------------------------------------------------------------
 
-$Script:CopyWorker = {
-    param($Item)
+# --------------------------------------------------------------- copy part --
+
+# Runs inside the runspace pool, so it cannot use the functions above
+$CopyFile = {
+    param($File)
 
     $result = [pscustomobject]@{
-        SourceCode   = $Item.SourceCode
-        RelativePath = $Item.RelativePath
-        SizeBytes    = $Item.SizeBytes
+        SourceCode   = $File.SourceCode
+        RelativePath = $File.RelativePath
+        SizeBytes    = $File.SizeBytes
         Status       = 'FAIL'
         ErrorText    = $null
         DurationMs   = 0
         Attempts     = 0
         DiskFull     = $false
-        Permission   = $false
+        AccessDenied = $false
     }
 
-    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
 
-    for ($attempt = 1; $attempt -le $Item.MaxAttempts; $attempt++) {
+    for ($attempt = 1; $attempt -le $File.MaxAttempts; $attempt++) {
+
         $result.Attempts = $attempt
+
         try {
-            if ($Item.Simulate) {
+            if ($File.Simulate) {
                 $result.Status = 'WHATIF'
                 $result.ErrorText = $null
                 break
             }
 
-            $destDir = Split-Path -Parent $Item.DestinationPath
-            if ($destDir -and -not (Test-Path -LiteralPath $destDir)) {
-                New-Item -ItemType Directory -Path $destDir -Force -ErrorAction Stop | Out-Null
+            $folder = Split-Path -Parent $File.DestinationPath
+            if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                New-Item -ItemType Directory -Path $folder -Force -ErrorAction Stop | Out-Null
             }
 
-            Copy-Item -LiteralPath $Item.SourcePath -Destination $Item.DestinationPath -Force -ErrorAction Stop
+            Copy-Item -LiteralPath $File.SourcePath -Destination $File.DestinationPath -Force -ErrorAction Stop
 
-            if ($Item.PreserveTimestamps) {
-                try {
-                    $copied = Get-Item -LiteralPath $Item.DestinationPath -Force -ErrorAction Stop
-                    $copied.LastWriteTimeUtc = $Item.SourceLastWriteUtc
-                }
-                catch {
-                    # Non fatal: the file is there, only the timestamp could not be aligned.
-                }
+            # keep the source timestamp, otherwise the file looks older than the source
+            # on the next run and would be copied again and again
+            try {
+                (Get-Item -LiteralPath $File.DestinationPath -Force).LastWriteTimeUtc = $File.LastWriteUtc
             }
+            catch { }
 
             $result.Status = 'SUCCESS'
             $result.ErrorText = $null
             break
         }
         catch {
-            $ex = $_.Exception
-            $result.ErrorText = $ex.Message
-            $hres = 0
-            try { $hres = $ex.HResult } catch { $hres = 0 }
+            $exception = $_.Exception
+            $result.ErrorText = $exception.Message
 
-            $isDiskFull = ($hres -eq -2147024784) -or ($ex.Message -match 'not enough space|disk is full')
-            $isPermission = ($ex -is [System.UnauthorizedAccessException]) -or ($hres -eq -2147024891) -or
-                            ($ex.Message -match 'Access to the path .* is denied|Permission denied|denied')
+            $hresult = 0
+            try { $hresult = $exception.HResult } catch { }
 
-            if ($isDiskFull) {
+            # no point in retrying these two
+            if ($hresult -eq -2147024784 -or $exception.Message -match 'not enough space|disk is full') {
                 $result.DiskFull = $true
-                $result.Status = 'FAIL'
                 break
             }
-            if ($isPermission) {
-                $result.Permission = $true
-                $result.Status = 'FAIL'
+            if ($exception -is [System.UnauthorizedAccessException] -or $hresult -eq -2147024891 -or
+                $exception.Message -match 'is denied|Permission denied') {
+                $result.AccessDenied = $true
                 break
             }
-            if ($attempt -lt $Item.MaxAttempts) {
-                Start-Sleep -Seconds $Item.RetryDelaySeconds
-                continue
+
+            if ($attempt -lt $File.MaxAttempts) {
+                Start-Sleep -Seconds $File.RetryDelaySeconds
             }
-            $result.Status = 'FAIL'
         }
     }
 
-    $sw.Stop()
-    $result.DurationMs = [int]$sw.ElapsedMilliseconds
+    $watch.Stop()
+    $result.DurationMs = [int]$watch.ElapsedMilliseconds
     return $result
 }
 
-function Invoke-CopyPlan {
-    <# Executes the plan through a throttled runspace pool and logs every outcome. #>
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)]$Plan
-    )
+function Copy-FileList {
+    param($Config, $Files)
 
-    $outcome = [pscustomobject]@{ Copied = 0; Failed = 0; DiskFull = $false }
-    if ($Plan.Count -eq 0) { return $outcome }
+    $summary = [pscustomobject]@{ Copied = 0; Failed = 0; DiskFull = $false }
+    if ($Files.Count -eq 0) { return $summary }
 
-    $throttle = [math]::Min($Config.MaxConcurrentCopies, $Plan.Count)
-    $pool = [runspacefactory]::CreateRunspacePool(1, $throttle)
+    $pool = [runspacefactory]::CreateRunspacePool(1, [math]::Min($Config.MaxConcurrentCopies, $Files.Count))
     $pool.Open()
-    $handles = New-Object System.Collections.ArrayList
+
+    $running = New-Object System.Collections.ArrayList
 
     try {
-        foreach ($item in $Plan) {
-            $ps = [powershell]::Create()
-            $ps.RunspacePool = $pool
-            [void]$ps.AddScript($Script:CopyWorker.ToString()).AddArgument($item)
-            [void]$handles.Add([pscustomobject]@{ Shell = $ps; Handle = $ps.BeginInvoke(); Item = $item })
+        foreach ($file in $Files) {
+            $shell = [powershell]::Create()
+            $shell.RunspacePool = $pool
+            [void]$shell.AddScript($CopyFile.ToString()).AddArgument($file)
+
+            [void]$running.Add([pscustomobject]@{
+                Shell  = $shell
+                Handle = $shell.BeginInvoke()
+                File   = $file
+            })
         }
 
-        foreach ($h in $handles) {
-            $res = $null
+        foreach ($job in $running) {
+
             try {
-                $res = $h.Shell.EndInvoke($h.Handle) | Select-Object -Last 1
+                $result = $job.Shell.EndInvoke($job.Handle) | Select-Object -Last 1
             }
             catch {
-                $res = [pscustomobject]@{
-                    SourceCode = $h.Item.SourceCode; RelativePath = $h.Item.RelativePath
-                    SizeBytes = $h.Item.SizeBytes; Status = 'FAIL'; ErrorText = $_.Exception.Message
-                    DurationMs = 0; Attempts = 0; DiskFull = $false; Permission = $false
+                $result = [pscustomobject]@{
+                    SourceCode = $job.File.SourceCode
+                    RelativePath = $job.File.RelativePath
+                    SizeBytes = $job.File.SizeBytes
+                    Status = 'FAIL'
+                    ErrorText = $_.Exception.Message
+                    DurationMs = 0
+                    Attempts = 0
+                    DiskFull = $false
+                    AccessDenied = $false
                 }
             }
             finally {
-                $h.Shell.Dispose()
+                $job.Shell.Dispose()
             }
 
-            if ($null -eq $res) { continue }
+            if ($null -eq $result) { continue }
 
-            $size = Format-FileSize $res.SizeBytes
-            $duration = "$($res.DurationMs)ms"
+            $size = Format-FileSize $result.SizeBytes
 
-            if ($res.Status -eq 'SUCCESS' -or $res.Status -eq 'WHATIF') {
-                $outcome.Copied++
+            if ($result.Status -eq 'SUCCESS' -or $result.Status -eq 'WHATIF') {
+
+                $summary.Copied++
                 $Script:Stats.Copied++
-                $Script:Stats.TotalDurationMs += $res.DurationMs
-                $errText = '-'
-                if ($null -ne $h.Item.SizeWarning) {
-                    $errText = $h.Item.SizeWarning
+                $Script:Stats.TotalDurationMs += $result.DurationMs
+
+                $comment = '-'
+                if ($null -ne $job.File.SizeWarning) {
+                    $comment = $job.File.SizeWarning
                     $Script:Stats.Warnings++
                 }
-                Write-SyncLog -Server $res.SourceCode -Action 'COPY' -SourceFile $res.RelativePath `
-                    -DestinationServers $Script:LocalCode -Status $res.Status -Size $size -Duration $duration -ErrorText $errText
+
+                Write-SyncLog -Server $result.SourceCode -Action 'COPY' -SourceFile $result.RelativePath `
+                    -DestinationServers $Script:LocalCode -Status $result.Status -Size $size `
+                    -Duration "$($result.DurationMs)ms" -ErrorText $comment
             }
             else {
-                $outcome.Failed++
+                $summary.Failed++
                 $Script:Stats.Errors++
-                if ($res.DiskFull) { $outcome.DiskFull = $true }
+                if ($result.DiskFull) { $summary.DiskFull = $true }
+
                 $status = 'FAIL'
-                if ($res.Permission -or $res.DiskFull) { $status = 'CRITICAL' }
-                $err = $res.ErrorText
-                if ($res.Attempts -gt 1) { $err = "$err (after $($res.Attempts) attempts)" }
-                Write-SyncLog -Server $res.SourceCode -Action 'COPY' -SourceFile $res.RelativePath `
-                    -DestinationServers $Script:LocalCode -Status $status -Size $size -Duration '-' -ErrorText $err
+                if ($result.AccessDenied -or $result.DiskFull) { $status = 'CRITICAL' }
+
+                $errorText = $result.ErrorText
+                if ($result.Attempts -gt 1) { $errorText = "$errorText (after $($result.Attempts) attempts)" }
+
+                Write-SyncLog -Server $result.SourceCode -Action 'COPY' -SourceFile $result.RelativePath `
+                    -DestinationServers $Script:LocalCode -Status $status -Size $size -ErrorText $errorText
             }
         }
     }
@@ -973,154 +887,147 @@ function Invoke-CopyPlan {
         $pool.Dispose()
     }
 
-    return $outcome
+    return $summary
 }
 
-# ---------------------------------------------------------------------------
-# region Cycle
-# ---------------------------------------------------------------------------
+
+# ------------------------------------------------------------------- cycle --
 
 function Invoke-SyncCycle {
-    param(
-        [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)][string[]]$SourceServers,
-        [Parameter(Mandatory = $true)][bool]$Simulate
-    )
+    param($Config, [string[]]$SourceServers, [bool]$Simulate)
 
-    $cycle = [pscustomobject]@{ Copied = 0; Failed = 0; DiskFull = $false; Skipped = $false }
+    $cycle = [pscustomobject]@{ Copied = 0; Failed = 0; DiskFull = $false }
 
-    if (-not (Enter-SyncLock -Config $Config)) {
-        Write-SyncLog -Action 'LOCK' -SourceFile $Config.LockFilePath -Status 'SKIPPED' `
-            -ErrorText 'Another instance is running, cycle skipped'
-        $cycle.Skipped = $true
+    if (-not (Enter-SyncLock $Config)) {
+        Write-SyncLog -Action 'LOCK' -SourceFile $Config.LockFile -Status 'SKIPPED' `
+            -ErrorText 'Another instance is running, this cycle is skipped'
         return $cycle
     }
 
     try {
-        $free = Get-FreeSpaceMB -Path $Config.DestinationBasePath
-        if ($free -ge 0 -and $free -lt $Config.MinFreeSpaceMB) {
+        $freeSpace = Get-FreeSpaceMB $Config.DestinationBasePath
+        if ($freeSpace -ge 0 -and $freeSpace -lt $Config.MinFreeSpaceMB) {
             Write-SyncLog -Action 'DISK_CHECK' -SourceFile $Config.DestinationBasePath -Status 'CRITICAL' `
-                -Size ("{0}MB free" -f $free) -ErrorText "Free space below MinFreeSpaceMB ($($Config.MinFreeSpaceMB)MB) - synchronization paused"
+                -Size "${freeSpace}MB free" `
+                -ErrorText "Free space below MinFreeSpaceMB ($($Config.MinFreeSpaceMB)MB), synchronization paused"
             $Script:Stats.Errors++
             $cycle.DiskFull = $true
             return $cycle
         }
 
-        $plan = @(New-CopyPlan -Config $Config -SourceServers $SourceServers -Simulate $Simulate)
-        Write-SyncLog -Action 'SCAN' -SourceFile ("{0} source server(s)" -f $SourceServers.Count) `
-            -DestinationServers $Script:LocalCode -Status 'SUCCESS' -Size ("{0} file(s) to copy" -f $plan.Count)
+        $files = @(Get-FilesToCopy $Config $SourceServers $Simulate)
 
-        $res = Invoke-CopyPlan -Config $Config -Plan $plan
-        $cycle.Copied = $res.Copied
-        $cycle.Failed = $res.Failed
-        $cycle.DiskFull = $res.DiskFull
+        Write-SyncLog -Action 'SCAN' -SourceFile "$($SourceServers.Count) source server(s)" `
+            -DestinationServers $Script:LocalCode -Status 'SUCCESS' -Size "$($files.Count) file(s) to copy"
+
+        $result = Copy-FileList $Config $files
+        $cycle.Copied = $result.Copied
+        $cycle.Failed = $result.Failed
+        $cycle.DiskFull = $result.DiskFull
     }
     catch {
-        Write-SyncLog -Action 'CYCLE' -Status 'CRITICAL' -ErrorText "Unhandled error: $($_.Exception.Message)"
+        Write-SyncLog -Action 'CYCLE' -Status 'CRITICAL' -ErrorText "Unexpected error: $($_.Exception.Message)"
         $Script:Stats.Errors++
     }
     finally {
-        Exit-SyncLock -Config $Config
+        Exit-SyncLock $Config
     }
 
     return $cycle
 }
 
-# ---------------------------------------------------------------------------
-# region Main
-# ---------------------------------------------------------------------------
 
-function Invoke-Main {
+# -------------------------------------------------------------------- main --
+
+function Start-Sync {
+
     $simulate = -not $PSCmdlet.ShouldProcess('destination files', 'Copy')
-    # -WhatIf would otherwise also neutralize Add-Content/New-Item, i.e. the log file and
-    # the lock file. Only the copies must be simulated, so the preference is reset here and
-    # the simulation is carried by the $simulate flag alone.
+
+    # -WhatIf would also block Add-Content and New-Item, so the log file and the lock file
+    # would not be created either. Only the copy has to be simulated.
     $Script:WhatIfPreference = $false
     $WhatIfPreference = $false
 
-    $config = Get-SyncConfiguration -Path $ConfigPath
-    Initialize-LogFile -Config $config
-    Update-DailyStats -Config $config
+    $config = Get-SyncConfiguration $ConfigPath
+    Initialize-LogFile $config
+    Update-DayCounter $config
 
-    $Script:LocalCode = Resolve-LocalServerCode -Config $config -Override $LocalServerCode
-    $localEnv = $config.ServerEnvironment[$Script:LocalCode]
+    $Script:LocalCode = Resolve-LocalServerCode $config $LocalServerCode
+    $localEnvironment = $config.ServerEnvironment[$Script:LocalCode]
 
     $mode = 'LIVE'
     if ($simulate) { $mode = 'WHATIF' }
+
     $account = [System.Environment]::UserName
     if ($env:USERDOMAIN) { $account = "$env:USERDOMAIN\$account" }
-    Write-SyncLog -Action 'START' -SourceFile ("v{0}" -f $Script:ScriptVersion) -DestinationServers $Script:LocalCode `
-        -Status $mode -ErrorText ("Account: {0}; PowerShell {1}" -f $account, $PSVersionTable.PSVersion)
 
-    if (-not $config.Mapping.ContainsKey($localEnv)) {
+    Write-SyncLog -Action 'START' -SourceFile "v$Version" -DestinationServers $Script:LocalCode -Status $mode `
+        -ErrorText "Account: $account; PowerShell $($PSVersionTable.PSVersion)"
+
+    if (-not $config.Mapping.ContainsKey($localEnvironment)) {
         Write-SyncLog -Action 'START' -DestinationServers $Script:LocalCode -Status 'SKIPPED' `
-            -ErrorText "Environment $localEnv has no source environment in [MAPPING] - nothing to pull."
+            -ErrorText "No source environment for $localEnvironment in [MAPPING], nothing to pull."
         return 0
     }
 
-    $sourceEnv = $config.Mapping[$localEnv]
-    $sourceServers = @($config.Environments[$sourceEnv].Keys)
+    $sourceEnvironment = $config.Mapping[$localEnvironment]
+    $sourceServers = @($config.Environments[$sourceEnvironment].Keys)
+
     if ($sourceServers.Count -eq 0) {
         Write-SyncLog -Action 'START' -DestinationServers $Script:LocalCode -Status 'FAIL' `
-            -ErrorText "Source environment [$sourceEnv] contains no server."
+            -ErrorText "Source environment [$sourceEnvironment] has no server."
         return 2
     }
 
     Write-SyncLog -Action 'CONFIG' -SourceFile $config.ConfigPath -DestinationServers $Script:LocalCode -Status 'SUCCESS' `
-        -ErrorText ("{0} ({1}) pulls from {2}: {3}; interval {4}min; max {5}MB; {6} parallel" -f `
-            $Script:LocalCode, $localEnv, $sourceEnv, ($sourceServers -join ','), `
-            $config.SyncIntervalMinutes, $config.MaxFileSizeMB, $config.MaxConcurrentCopies)
+        -ErrorText ("$($Script:LocalCode) ($localEnvironment) pulls from ${sourceEnvironment}: $($sourceServers -join ',');" +
+                    " interval $($config.SyncIntervalMinutes)min; max $($config.MaxFileSizeMB)MB;" +
+                    " $($config.MaxConcurrentCopies) parallel copies")
 
-    Remove-OldLogFile -Config $config
+    Remove-OldLog $config
 
-    $cycles = 0
+    $cycleCount = 0
     $exitCode = 0
 
     while ($true) {
-        $cycles++
-        Update-DailyStats -Config $config
-        Initialize-LogFile -Config $config
 
-        $result = Invoke-SyncCycle -Config $config -SourceServers $sourceServers -Simulate $simulate
-        if ($result.Failed -gt 0) { $exitCode = 1 }
+        $cycleCount++
+        Update-DayCounter $config
+        Initialize-LogFile $config
+
+        $cycle = Invoke-SyncCycle $config $sourceServers $simulate
+        if ($cycle.Failed -gt 0) { $exitCode = 1 }
 
         if ($RunOnce) { break }
-        if ($MaxCycles -gt 0 -and $cycles -ge $MaxCycles) { break }
 
-        $sleepMinutes = $config.SyncIntervalMinutes
-        if ($result.DiskFull) {
-            $sleepMinutes = $config.DiskFullPauseMinutes
+        # disk full needs someone to have a look, no point in retrying every 10 minutes
+        $waitMinutes = $config.SyncIntervalMinutes
+        if ($cycle.DiskFull) {
+            $waitMinutes = 30
             Write-SyncLog -Action 'PAUSE' -Status 'CRITICAL' `
-                -ErrorText "Disk full condition - pausing $sleepMinutes minutes, administrator action required"
+                -ErrorText "Disk full, waiting $waitMinutes minutes, admin action needed"
         }
 
-        $next = (Get-Date).AddMinutes($sleepMinutes)
-        Write-HeartbeatLog -NextRun $next
-        Start-Sleep -Seconds ($sleepMinutes * 60)
+        Write-Heartbeat (Get-Date).AddMinutes($waitMinutes)
+        Start-Sleep -Seconds ($waitMinutes * 60)
     }
 
     if ($RunOnce) {
-        Write-HeartbeatLog -NextRun ((Get-Date).AddMinutes($config.SyncIntervalMinutes))
+        Write-Heartbeat (Get-Date).AddMinutes($config.SyncIntervalMinutes)
     }
-    Write-SummaryLog -Stats $Script:Stats
-    Write-SyncLog -Action 'STOP' -DestinationServers $Script:LocalCode -Status 'SUCCESS' `
-        -ErrorText ("Cycles: {0}" -f $cycles)
+
+    Write-Summary $Script:Stats
+    Write-SyncLog -Action 'STOP' -DestinationServers $Script:LocalCode -Status 'SUCCESS' -ErrorText "Cycles: $cycleCount"
 
     return $exitCode
 }
 
-if ($LoadFunctionsOnly) { return }
 
 try {
-    $code = Invoke-Main
-    exit $code
+    exit (Start-Sync)
 }
 catch {
-    $msg = $_.Exception.Message
-    try {
-        Write-SyncLog -Action 'FATAL' -Status 'CRITICAL' -ErrorText $msg
-    }
-    catch { }
-    Write-Error $msg
+    try { Write-SyncLog -Action 'FATAL' -Status 'CRITICAL' -ErrorText $_.Exception.Message } catch { }
+    Write-Error $_.Exception.Message
     exit 3
 }
