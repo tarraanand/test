@@ -331,6 +331,7 @@ function Get-SyncConfiguration {
         Environments              = [ordered]@{}
         ServerEnvironment         = @{}
         ServerHost                = [ordered]@{}
+        ServerComputerName        = @{}
         SourceRootPerEnvironment  = @{}
         Mapping                   = @{}
         Include                   = New-Object System.Collections.ArrayList
@@ -363,6 +364,18 @@ function Get-SyncConfiguration {
     foreach ($key in @($config.Mapping.Keys)) {
         if ($config.Mapping[$key] -eq $key) {
             throw "servers.ini [MAPPING]: '$key = $key' would synchronize an environment with itself."
+        }
+    }
+
+    # The computer name of the servers is not the same as the alias used for the share,
+    # so [HOSTNAMES] gives the real name used to recognize the local machine.
+    if ($ini.Contains('HOSTNAMES')) {
+        foreach ($key in $ini['HOSTNAMES'].Keys.Keys) {
+            $code = $key.Trim().ToUpper()
+            if (-not $config.ServerEnvironment.ContainsKey($code)) {
+                throw "servers.ini [HOSTNAMES]: '$code' is not defined in [DEV], [QA] or [PROD]."
+            }
+            $config.ServerComputerName[$code] = $ini['HOSTNAMES'].Keys[$key].Trim()
         }
     }
 
@@ -410,8 +423,19 @@ function Resolve-LocalServerCode {
     if ($env:COMPUTERNAME) { [void]$localNames.Add($env:COMPUTERNAME) }
     try { [void]$localNames.Add([System.Net.Dns]::GetHostName()) } catch { }
 
+    # first the real computer names of [HOSTNAMES]
+    foreach ($code in $Config.ServerComputerName.Keys) {
+        $iniName = ($Config.ServerComputerName[$code] -split '\.')[0]
+
+        foreach ($name in $localNames) {
+            if ([string]::IsNullOrWhiteSpace($name)) { continue }
+            if (($name -split '\.')[0] -eq $iniName) { return $code }
+        }
+    }
+
+    # then the alias of [DEV] / [QA] / [PROD], in case both are the same on some servers
     foreach ($code in $Config.ServerHost.Keys) {
-        $iniHost = $Config.ServerHost[$code].TrimStart('\', '/')
+        $iniHost = $Config.ServerHost[$code].TrimStart('\\', '/')
         $iniShortName = ($iniHost -split '\.')[0]
 
         foreach ($name in $localNames) {
@@ -421,7 +445,7 @@ function Resolve-LocalServerCode {
     }
 
     throw ("This computer ($($localNames -join ', ')) is not defined in $($Config.ConfigPath). " +
-           "Add it to the INI file or start the script with -LocalServerCode.")
+           "Add it to the [HOSTNAMES] section or start the script with -LocalServerCode.")
 }
 
 # \\SYQDDWHDEV1.res.sys.shared.fortis + template -> \\SYQDDWHDEV1.res.sys.shared.fortis\E$\Data\se-iciq
