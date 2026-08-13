@@ -655,10 +655,20 @@ function Get-FilesToCopy {
         $sourceRoot = Get-SourceRoot $Config $sourceCode
         $destinationRoot = Join-NativePath $Config.DestinationBasePath $sourceCode
 
-        if (-not (Test-Path -LiteralPath $sourceRoot)) {
+        # Test-Path does not return false but throws when the share refuses the access,
+        # so one unreachable server must not stop the whole cycle
+        $reachable = $false
+        $reason = 'Source folder not reachable (network, share or permissions)'
+        try {
+            $reachable = Test-Path -LiteralPath $sourceRoot
+        }
+        catch {
+            $reason = $_.Exception.Message
+        }
+
+        if (-not $reachable) {
             Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $sourceRoot `
-                -DestinationServers $Script:LocalCode -Status 'FAIL' `
-                -ErrorText 'Source folder not reachable (network, share or permissions)'
+                -DestinationServers $Script:LocalCode -Status 'FAIL' -ErrorText $reason
             $Script:Stats.Errors++
             continue
         }
