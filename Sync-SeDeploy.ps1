@@ -708,19 +708,21 @@ function Get-FilesToCopy {
                     try { $destinationFile = Get-Item -LiteralPath $destinationPath -Force } catch { }
                 }
 
-                # new file, newer file, or same timestamp but different size
-                $copyNeeded = $false
+                # new file, newer file, or same timestamp but different size.
+                # The reason is written in the log, it helps to understand why a file is
+                # taken when the result is compared with another tool.
+                $reason = $null
                 if ($null -eq $destinationFile) {
-                    $copyNeeded = $true
+                    $reason = 'NEW'
                 }
                 elseif (($file.LastWriteTimeUtc - $destinationFile.LastWriteTimeUtc).TotalSeconds -gt $Config.TimestampToleranceSeconds) {
-                    $copyNeeded = $true
+                    $reason = 'NEWER'
                 }
                 elseif ($file.Length -ne $destinationFile.Length) {
-                    $copyNeeded = $true
+                    $reason = 'SIZE'
                 }
 
-                if (-not $copyNeeded) { continue }
+                if ($null -eq $reason) { continue }
 
                 # too big files are skipped, except when the INI lists the file by name
                 $sizeWarning = $null
@@ -743,6 +745,7 @@ function Get-FilesToCopy {
                     DestinationPath   = $destinationPath
                     SizeBytes         = [long]$file.Length
                     LastWriteUtc      = $file.LastWriteTimeUtc
+                    CopyReason        = $reason
                     SizeWarning       = $sizeWarning
                     MaxAttempts       = $Config.RetryCount
                     RetryDelaySeconds = $Config.RetryDelaySeconds
@@ -890,9 +893,9 @@ function Copy-FileList {
                 $Script:Stats.Copied++
                 $Script:Stats.TotalDurationMs += $result.DurationMs
 
-                $comment = '-'
+                $comment = $job.File.CopyReason
                 if ($null -ne $job.File.SizeWarning) {
-                    $comment = $job.File.SizeWarning
+                    $comment = "$comment; $($job.File.SizeWarning)"
                     $Script:Stats.Warnings++
                 }
 
