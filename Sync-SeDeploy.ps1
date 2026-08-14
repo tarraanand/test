@@ -327,7 +327,6 @@ function Get-SyncConfiguration {
         RetryDelaySeconds         = Get-IniInt $ini 'GLOBAL' 'RetryDelaySeconds' 5
         MinFreeSpaceMB            = Get-IniInt $ini 'GLOBAL' 'MinFreeSpaceMB' 1024
         LockTimeoutMinutes        = Get-IniInt $ini 'GLOBAL' 'LockTimeoutMinutes' 60
-        RobocopyPath              = Get-IniValue $ini 'GLOBAL' 'RobocopyPath' 'robocopy.exe'
         RobocopyThreads           = Get-IniInt $ini 'GLOBAL' 'MaxConcurrentCopies' 4
         MirrorDeletions           = (Get-IniValue $ini 'GLOBAL' 'MirrorDeletions' 'False') -match '^(?i)(true|yes|1)$'
         Environments              = [ordered]@{}
@@ -841,7 +840,7 @@ function Invoke-RobocopyJob {
 
     $output = @()
     try {
-        $output = @(& $Config.RobocopyPath @arguments 2>&1)
+        $output = @(& robocopy.exe @arguments 2>&1)
         $result.ExitCode = $LASTEXITCODE
     }
     catch {
