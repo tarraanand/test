@@ -13,6 +13,10 @@
     Files are copied to DestinationBasePath\<source server code>\<relative path>, for
     example E:\Data\se-iciq\se-deploy\D1\Se-common\bat\script.ps1.
 
+    Listing, comparing, copying and deleting are done with the .NET file APIs inside the
+    PowerShell process. No external program is started, so the Net-Only credentials of the
+    session remain valid for every network access.
+
     Everything is configured in servers.ini, nothing is hardcoded here. Adding a server or
     an exclusion pattern means editing the INI file only.
 
@@ -41,7 +45,7 @@
     Account : callssp (read on the source shares, read + write on the local destination
               folder; read on the destination is needed for the timestamp comparison)
     Written for Windows PowerShell 5.1, also works on PowerShell 7.
-    Version : 1.0
+    Version : 2.0 - native PowerShell copy engine, robocopy removed.
 #>
 
 [CmdletBinding(SupportsShouldProcess = $true)]
@@ -55,7 +59,11 @@ Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
 $Sep = [System.IO.Path]::DirectorySeparatorChar
-$Version = '1.0'
+$Version = '2.0'
+
+# A file is considered changed when the timestamps differ by more than this. Two seconds is
+# the usual tolerance, some file systems store the write time with a two second precision.
+$TimeToleranceSeconds = 2
 
 # Filled in later, used by most functions
 $Script:LogFile = $null
@@ -322,12 +330,10 @@ function Get-SyncConfiguration {
         LogRetentionDays          = Get-IniInt $ini 'GLOBAL' 'LogRetentionDays' 7
         SyncIntervalMinutes       = Get-IniInt $ini 'GLOBAL' 'SyncIntervalMinutes' 10
         MaxFileSizeMB             = Get-IniInt $ini 'GLOBAL' 'MaxFileSizeMB' 100
-        MaxConcurrentCopies       = Get-IniInt $ini 'GLOBAL' 'MaxConcurrentCopies' 4
         RetryCount                = Get-IniInt $ini 'GLOBAL' 'RetryCount' 3
         RetryDelaySeconds         = Get-IniInt $ini 'GLOBAL' 'RetryDelaySeconds' 5
         MinFreeSpaceMB            = Get-IniInt $ini 'GLOBAL' 'MinFreeSpaceMB' 1024
         LockTimeoutMinutes        = Get-IniInt $ini 'GLOBAL' 'LockTimeoutMinutes' 60
-        RobocopyThreads           = Get-IniInt $ini 'GLOBAL' 'MaxConcurrentCopies' 4
         MirrorDeletions           = (Get-IniValue $ini 'GLOBAL' 'MirrorDeletions' 'False') -match '^(?i)(true|yes|1)$'
         Environments              = [ordered]@{}
         ServerEnvironment         = @{}
@@ -400,7 +406,6 @@ function Get-SyncConfiguration {
         throw 'servers.ini: [INCLUDE] is empty, nothing would be synchronized.'
     }
 
-    if ($config.MaxConcurrentCopies -lt 1) { $config.MaxConcurrentCopies = 1 }
     if ($config.RetryCount -lt 1) { $config.RetryCount = 1 }
     if ($config.SyncIntervalMinutes -lt 1) { $config.SyncIntervalMinutes = 1 }
 
@@ -449,7 +454,7 @@ function Resolve-LocalServerCode {
            "Add it to the [HOSTNAMES] section or start the script with -LocalServerCode.")
 }
 
-# \\SYQDDWHDEV1.res.sys.shared.fortis + template -> \\SYQDDWHDEV1.res.sys.shared.fortis\E$\Data\se-iciq
+# \\SYQDDWHDEV1.res.sys.shared.fortis + template -> \\SYQDDWHDEV1.res.sys.shared.fortis\iciq@iciq
 function Get-SourceRoot {
     param($Config, [string]$ServerCode)
 
@@ -507,6 +512,38 @@ function Test-FileExclusion {
 
     return $false
 }
+
+# Folder version, used to stop walking into an excluded folder. Only the patterns that
+# clearly mean a folder are used here (ending with \ or with \*), a bare file pattern such
+# as *.tmp must never remove a folder.
+function Test-FolderExclusion {
+    param([string]$RelativePath, $Patterns)
+
+    $path = ($RelativePath -replace '/', '\').TrimStart('\')
+    if ($path -eq '') { return $false }
+    $folderName = ($path -split '\\')[-1]
+
+    foreach ($rawPattern in $Patterns) {
+
+        $pattern = (([string]$rawPattern).Trim() -replace '/', '\').TrimStart('\')
+        if ($pattern -eq '') { continue }
+
+        if ($pattern.EndsWith('\*')) { $pattern = $pattern.Substring(0, $pattern.Length - 2) }
+        elseif ($pattern.EndsWith('\')) { $pattern = $pattern.TrimEnd('\') }
+        else { continue }
+
+        if ($pattern -eq '') { continue }
+
+        if ($pattern.Contains('\')) {
+            if ($path -like $pattern) { return $true }
+            if ($path -like "*\$pattern") { return $true }
+        }
+        elseif ($folderName -like $pattern) { return $true }
+    }
+
+    return $false
+}
+
 
 # --------------------------------------------------------------- lock file --
 
@@ -604,348 +641,420 @@ function Get-FreeSpaceMB {
     }
 }
 
-# --------------------------------------------------------- robocopy engine --
+
+# ----------------------------------------------------------- copy engine --
 
 <#
-    One robocopy call is prepared per source server and per [INCLUDE] entry.
+    Everything below uses System.IO only, so the copy runs inside this PowerShell process
+    and keeps the credentials of the session. No external process is started.
 
-    Folder entry (line ending with \) :
-        robocopy <source folder> <destination folder> *.* /E [/MIR] /MAX:... /XD ... /XF ...
-    Single file entry (line without \ at the end) :
-        robocopy <source folder> <destination folder> <file name>
-        no /MIR and no /MAX here, the file is listed by name so it is always taken.
-
-    /MIR is only added when MirrorDeletions is True and the source folder is not empty.
-    Mirroring an empty source would delete the whole destination folder, and an empty
-    listing is more often a share problem than a real deletion.
+    Get-FileTree walks a folder and returns the files and the subfolders it contains, with
+    their path relative to the given root. Excluded folders are not walked at all. A folder
+    that cannot be read gives a warning and sets HadError, which is what stops the deletion
+    of files at the destination for that entry.
 #>
+function Get-FileTree {
+    param([string]$Root, [string]$Folder, $Config, [string]$ServerCode)
 
-function ConvertTo-RobocopyFilter {
-    <#
-        Translates the [EXCLUDE] patterns into /XD (folders) and /XF (files) for one
-        include folder. Patterns that are outside this folder are ignored for this call.
-    #>
-    param($Config, [string]$IncludeRelative, [string]$SourceFolder)
-
-    $excludeDirs = New-Object System.Collections.ArrayList
-    $excludeFiles = New-Object System.Collections.ArrayList
-
-    $includePrefix = ($IncludeRelative -replace '/', '\').Trim('\')
-
-    foreach ($rawPattern in $Config.Exclude) {
-
-        $pattern = (([string]$rawPattern).Trim() -replace '/', '\').TrimStart('\')
-        if ($pattern -eq '') { continue }
-
-        $isFolder = $pattern.EndsWith('\')
-        $pattern = $pattern.TrimEnd('\')
-
-        # temp\* means a folder named temp, robocopy matches a bare name at any depth
-        if ($pattern.EndsWith('\*')) {
-            $isFolder = $true
-            $pattern = $pattern.Substring(0, $pattern.Length - 2)
-        }
-
-        if (-not $pattern.Contains('\')) {
-            # bare name or wildcard, robocopy applies it at any depth
-            if ($isFolder) { [void]$excludeDirs.Add($pattern) }
-            else { [void]$excludeFiles.Add($pattern) }
-            continue
-        }
-
-        # pattern with a path: only relevant if it is inside the folder being copied
-        if ($includePrefix -ne '' -and $pattern.StartsWith($includePrefix + '\', [System.StringComparison]::OrdinalIgnoreCase)) {
-            $below = $pattern.Substring($includePrefix.Length + 1)
-            $full = Join-NativePath $SourceFolder $below
-            if ($isFolder) { [void]$excludeDirs.Add($full) }
-            else { [void]$excludeFiles.Add($full) }
-        }
-        elseif ($includePrefix -eq '') {
-            $full = Join-NativePath $SourceFolder $pattern
-            if ($isFolder) { [void]$excludeDirs.Add($full) }
-            else { [void]$excludeFiles.Add($full) }
-        }
+    $result = [pscustomobject]@{
+        Files    = New-Object System.Collections.ArrayList
+        Folders  = New-Object System.Collections.ArrayList
+        HadError = $false
     }
 
-    return [pscustomobject]@{
-        Directories = $excludeDirs
-        Files       = $excludeFiles
-    }
-}
+    $pending = New-Object System.Collections.Stack
+    $pending.Push($Folder)
 
-function Get-RobocopyJob {
-    <# Builds the list of robocopy calls for all source servers. #>
-    param($Config, [string[]]$SourceServers, [bool]$Simulate)
+    while ($pending.Count -gt 0) {
 
-    $jobs = New-Object System.Collections.ArrayList
-    $maxBytes = [long]$Config.MaxFileSizeMB * 1MB
+        $current = $pending.Pop()
 
-    foreach ($sourceCode in $SourceServers) {
-
-        $sourceRoot = Get-SourceRoot $Config $sourceCode
-        $destinationRoot = Join-NativePath $Config.DestinationBasePath $sourceCode
-
-        $reachable = $false
-        $reason = 'Source folder not reachable (network, share or permissions)'
         try {
-            $reachable = Test-Path -LiteralPath $sourceRoot
+            $info = New-Object System.IO.DirectoryInfo($current)
+            $subFolders = @($info.GetDirectories())
+            $files = @($info.GetFiles())
         }
         catch {
-            $reason = $_.Exception.Message
-        }
-
-        if (-not $reachable) {
-            Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $sourceRoot `
-                -DestinationServers $Script:LocalCode -Status 'FAIL' -ErrorText $reason
-            $Script:Stats.Errors++
+            $result.HadError = $true
+            Write-SyncLog -Server $ServerCode -Action 'SCAN' -SourceFile (Get-RelativePath $current $Root) `
+                -DestinationServers $Script:LocalCode -Status 'WARNING' -ErrorText $_.Exception.Message
+            $Script:Stats.Warnings++
             continue
         }
 
-        foreach ($entry in $Config.Include) {
-
-            $isFolderEntry = $entry.EndsWith('\') -or $entry.EndsWith('/')
-            $relative = $entry.TrimEnd('\', '/')
-            $sourcePath = Join-NativePath $sourceRoot $relative
-
-            if (-not (Test-Path -LiteralPath $sourcePath)) {
-                Write-SyncLog -Server $sourceCode -Action 'SCAN' -SourceFile $entry `
-                    -DestinationServers $Script:LocalCode -Status 'WARNING' `
-                    -ErrorText 'INCLUDE path does not exist on the source server'
-                $Script:Stats.Warnings++
-                continue
-            }
-
-            $options = New-Object System.Collections.ArrayList
-            [void]$options.AddRange(@('/COPY:DAT', '/DCOPY:T', '/BYTES', '/NP', '/NJH', '/NJS',
-                    "/R:$($Config.RetryCount)", "/W:$($Config.RetryDelaySeconds)"))
-
-            if ($Config.RobocopyThreads -gt 1) { [void]$options.Add("/MT:$($Config.RobocopyThreads)") }
-            if ($Simulate) { [void]$options.Add('/L') }
-
-            if ($isFolderEntry) {
-                $sourceFolder = $sourcePath
-                $destinationFolder = Join-NativePath $destinationRoot $relative
-                $fileMask = @()   # no mask = *.* for robocopy, and nothing a shell could expand
-
-                [void]$options.Add('/E')
-
-                # mirror only when the source really has something in it
-                if ($Config.MirrorDeletions) {
-                    $sourceIsEmpty = $true
-                    try {
-                        $sourceIsEmpty = ((@(Get-ChildItem -LiteralPath $sourceFolder -File -Recurse -Force -ErrorAction Stop)).Count -eq 0)
-                    }
-                    catch {
-                        $sourceIsEmpty = $true
-                    }
-
-                    if ($sourceIsEmpty) {
-                        Write-SyncLog -Server $sourceCode -Action 'MIRROR' -SourceFile $relative `
-                            -DestinationServers $Script:LocalCode -Status 'WARNING' `
-                            -ErrorText 'Source folder empty or not readable, mirroring skipped for this folder (no deletion)'
-                        $Script:Stats.Warnings++
-                    }
-                    else {
-                        [void]$options.Add('/PURGE')
-                    }
-                }
-
-                if ($maxBytes -gt 0) { [void]$options.Add("/MAX:$maxBytes") }
-
-                $filter = ConvertTo-RobocopyFilter $Config $relative $sourceFolder
-                if ($filter.Directories.Count -gt 0) {
-                    [void]$options.Add('/XD')
-                    foreach ($d in $filter.Directories) { [void]$options.Add($d) }
-                }
-                if ($filter.Files.Count -gt 0) {
-                    [void]$options.Add('/XF')
-                    foreach ($f in $filter.Files) { [void]$options.Add($f) }
-                }
-            }
-            else {
-                # single file listed by name: no mirror, no size limit
-                $sourceFolder = Split-Path -Parent $sourcePath
-                $destinationFolder = Split-Path -Parent (Join-NativePath $destinationRoot $relative)
-                $fileMask = @((Split-Path -Leaf $sourcePath))
-            }
-
-            [void]$jobs.Add([pscustomobject]@{
-                SourceCode        = $sourceCode
-                SourceRoot        = $sourceRoot
-                DestinationRoot   = $destinationRoot
-                Entry             = $entry
-                Source            = $sourceFolder
-                Destination       = $destinationFolder
-                FileMask          = $fileMask
-                Options           = $options
-                Simulate          = $Simulate
+        foreach ($file in $files) {
+            [void]$result.Files.Add([pscustomobject]@{
+                Relative = Get-RelativePath $file.FullName $Root
+                Info     = $file
             })
         }
-    }
 
-    return $jobs
-}
+        foreach ($subFolder in $subFolders) {
+            $relative = Get-RelativePath $subFolder.FullName $Root
+            if (Test-FolderExclusion $relative $Config.Exclude) { continue }
 
-function Write-OversizedWarning {
-    <#
-        /MAX makes robocopy skip the big files silently. The requirement asks for a warning,
-        so the oversized files are listed separately. Only metadata is read, nothing is copied.
-    #>
-    param($Config, $Job)
-
-    if ($Config.MaxFileSizeMB -le 0) { return }
-    if ($Job.FileMask.Count -gt 0) { return }   # single file entry, no size limit applies
-
-    $maxBytes = [long]$Config.MaxFileSizeMB * 1MB
-
-    try {
-        $big = @(Get-ChildItem -LiteralPath $Job.Source -File -Recurse -Force -ErrorAction Stop |
-                Where-Object { $_.Length -gt $maxBytes })
-    }
-    catch {
-        return
-    }
-
-    foreach ($file in $big) {
-        $relativePath = Get-RelativePath $file.FullName $Job.SourceRoot
-        if (Test-FileExclusion $relativePath $Config.Exclude) { continue }
-
-        Write-SyncLog -Server $Job.SourceCode -Action 'SKIP' -SourceFile $relativePath `
-            -DestinationServers $Script:LocalCode -Status 'WARNING' -Size (Format-FileSize $file.Length) `
-            -ErrorText "File bigger than MaxFileSizeMB ($($Config.MaxFileSizeMB)MB)"
-        $Script:Stats.Warnings++
-    }
-}
-
-function Invoke-RobocopyJob {
-    <#
-        Runs one robocopy call and turns its output into the normal log lines.
-        Robocopy writes a directory header, then one line per file with the action, the
-        size and the name. The action word is kept as it is in the log, so a change of
-        language on the server cannot break the parsing.
-    #>
-    param($Config, $Job)
-
-    $result = [pscustomobject]@{ Copied = 0; Deleted = 0; Failed = 0; ExitCode = 0 }
-
-    $arguments = New-Object System.Collections.ArrayList
-    [void]$arguments.Add($Job.Source)
-    [void]$arguments.Add($Job.Destination)
-    foreach ($mask in $Job.FileMask) { [void]$arguments.Add($mask) }
-    foreach ($option in $Job.Options) { [void]$arguments.Add($option) }
-
-    Write-SyncLog -Server $Job.SourceCode -Action 'ROBOCOPY' -SourceFile $Job.Entry `
-        -DestinationServers $Script:LocalCode -Status 'START' `
-        -ErrorText (($arguments -join ' '))
-
-    $output = @()
-    try {
-        $output = @(& robocopy.exe @arguments 2>&1)
-        $result.ExitCode = $LASTEXITCODE
-    }
-    catch {
-        Write-SyncLog -Server $Job.SourceCode -Action 'ROBOCOPY' -SourceFile $Job.Entry `
-            -DestinationServers $Script:LocalCode -Status 'CRITICAL' -ErrorText $_.Exception.Message
-        $Script:Stats.Errors++
-        $result.Failed++
-        return $result
-    }
-
-    $currentFolder = $Job.Source
-
-    foreach ($rawLine in $output) {
-
-        $line = ([string]$rawLine).TrimEnd()
-        if ($line.Trim() -eq '') { continue }
-
-        if ($line -match 'ERROR\s+\d+') {
-            Write-SyncLog -Server $Job.SourceCode -Action 'COPY' -SourceFile $Job.Entry `
-                -DestinationServers $Script:LocalCode -Status 'FAIL' -ErrorText $line.Trim()
-            $Script:Stats.Errors++
-            $result.Failed++
-            continue
+            [void]$result.Folders.Add($relative)
+            $pending.Push($subFolder.FullName)
         }
-
-        # Both the folder header and the file lines look like: tab, value, tab, text.
-        # The folder header is the one whose text ends with a separator.
-        if ($line -notmatch '^\s*(?<action>[^\t]*?)\s*\t+\s*(?<size>\d+)\t(?<name>.+)$') { continue }
-
-        $action = $matches['action'].Trim()
-        $size = [long]$matches['size']
-        $name = $matches['name'].Trim()
-
-        if ($name.EndsWith('\') -or $name.EndsWith('/')) {
-            $currentFolder = $name.TrimEnd('\', '/')
-            continue
-        }
-
-        $isExtra = ($action -match '\*EXTRA')
-
-        $fullPath = $name
-        if ($name -notmatch '^(\\\\|[A-Za-z]:|/)') { $fullPath = Join-NativePath $currentFolder $name }
-
-        # a deleted file is at the destination, the others are at the source
-        $root = $Job.SourceRoot
-        if ($isExtra) { $root = $Job.DestinationRoot }
-
-        $relativePath = Get-RelativePath $fullPath $root
-        if ($relativePath -eq '') { $relativePath = $name }
-
-        $status = 'SUCCESS'
-        if ($Job.Simulate) { $status = 'WHATIF' }
-
-        if ($isExtra) {
-            $result.Deleted++
-            Write-SyncLog -Server $Job.SourceCode -Action 'DELETE' -SourceFile $relativePath `
-                -DestinationServers $Script:LocalCode -Status $status -Size (Format-FileSize $size) `
-                -ErrorText 'Not present on the source anymore'
-            continue
-        }
-
-        $result.Copied++
-        $Script:Stats.Copied++
-        $reason = $action
-        if ($reason -eq '') { $reason = 'COPY' }
-
-        Write-SyncLog -Server $Job.SourceCode -Action 'COPY' -SourceFile $relativePath `
-            -DestinationServers $Script:LocalCode -Status $status -Size (Format-FileSize $size) `
-            -ErrorText $reason
-    }
-
-    # robocopy: 0 nothing to do, 1 copied, 2 extra, 4 mismatch, 8 and above is a real failure
-    if ($result.ExitCode -ge 8) {
-        Write-SyncLog -Server $Job.SourceCode -Action 'ROBOCOPY' -SourceFile $Job.Entry `
-            -DestinationServers $Script:LocalCode -Status 'CRITICAL' `
-            -ErrorText "robocopy returned $($result.ExitCode) (8 = copy error, 16 = fatal error)"
-        $Script:Stats.Errors++
-        $result.Failed++
-    }
-    else {
-        Write-SyncLog -Server $Job.SourceCode -Action 'ROBOCOPY' -SourceFile $Job.Entry `
-            -DestinationServers $Script:LocalCode -Status 'SUCCESS' `
-            -Size ("{0} copied, {1} deleted" -f $result.Copied, $result.Deleted) `
-            -ErrorText "exit code $($result.ExitCode)"
     }
 
     return $result
 }
 
-function Invoke-AllRobocopyJob {
-    param($Config, $Jobs)
+# Copy needed when the file is new, when the size differs or when the write time differs
+function Test-CopyNeeded {
+    param($SourceInfo, $DestinationInfo)
 
-    $summary = [pscustomobject]@{ Copied = 0; Deleted = 0; Failed = 0 }
+    if (-not $DestinationInfo.Exists) { return 'New file' }
+    if ($SourceInfo.Length -ne $DestinationInfo.Length) { return 'Size differs' }
 
-    foreach ($job in $Jobs) {
-        Write-OversizedWarning $Config $job
+    $delta = ($SourceInfo.LastWriteTimeUtc - $DestinationInfo.LastWriteTimeUtc).TotalSeconds
+    if ([math]::Abs($delta) -le $TimeToleranceSeconds) { return $null }
+    if ($delta -gt 0) { return 'Newer' }
+    return 'Older on the source'
+}
 
-        $result = Invoke-RobocopyJob $Config $job
-        $summary.Copied += $result.Copied
-        $summary.Deleted += $result.Deleted
-        $summary.Failed += $result.Failed
+function Copy-SyncFile {
+    param($Config, $SourceInfo, [string]$DestinationPath)
+
+    $result = [pscustomobject]@{ Success = $false; ErrorText = ''; DurationMs = 0 }
+    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+
+    for ($attempt = 1; $attempt -le $Config.RetryCount; $attempt++) {
+
+        try {
+            $folder = [System.IO.Path]::GetDirectoryName($DestinationPath)
+            if (-not [System.IO.Directory]::Exists($folder)) {
+                [void][System.IO.Directory]::CreateDirectory($folder)
+            }
+
+            # a read only file at the destination cannot be overwritten
+            $existing = New-Object System.IO.FileInfo($DestinationPath)
+            if ($existing.Exists -and ($existing.Attributes -band [System.IO.FileAttributes]::ReadOnly)) {
+                $existing.Attributes = $existing.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+            }
+
+            [System.IO.File]::Copy($SourceInfo.FullName, $DestinationPath, $true)
+
+            # data, attributes and timestamps, same as the old /COPY:DAT
+            $copied = New-Object System.IO.FileInfo($DestinationPath)
+            $copied.Attributes = $SourceInfo.Attributes
+            $copied.CreationTimeUtc = $SourceInfo.CreationTimeUtc
+            $copied.LastWriteTimeUtc = $SourceInfo.LastWriteTimeUtc
+
+            $watch.Stop()
+            $result.Success = $true
+            $result.DurationMs = $watch.ElapsedMilliseconds
+            return $result
+        }
+        catch [System.UnauthorizedAccessException] {
+            # rights or read only file, retrying never helps
+            $result.ErrorText = $_.Exception.Message
+            break
+        }
+        catch {
+            $result.ErrorText = $_.Exception.Message
+            if ($attempt -lt $Config.RetryCount) {
+                Start-Sleep -Seconds $Config.RetryDelaySeconds
+                continue
+            }
+        }
     }
 
-    return $summary
+    $watch.Stop()
+    $result.DurationMs = $watch.ElapsedMilliseconds
+    if ([string]::IsNullOrWhiteSpace($result.ErrorText)) {
+        $result.ErrorText = 'Copy failed'
+    }
+    return $result
 }
+
+<#
+    Deletes at the destination the files that are not on the source anymore, then the
+    folders that became empty. Files matching an [EXCLUDE] pattern are never deleted, they
+    were never copied by this script.
+#>
+function Remove-ExtraItem {
+    param($Config, [string]$SourceCode, [string]$DestinationRoot, [string]$DestinationFolder,
+          $SourceTree, [bool]$Simulate)
+
+    $result = [pscustomobject]@{ Deleted = 0 }
+
+    if (-not [System.IO.Directory]::Exists($DestinationFolder)) { return $result }
+
+    $sourceFiles = @{}
+    foreach ($file in $SourceTree.Files) { $sourceFiles[$file.Relative.ToUpper()] = $true }
+
+    $sourceFolders = @{}
+    foreach ($folder in $SourceTree.Folders) { $sourceFolders[$folder.ToUpper()] = $true }
+
+    $destinationTree = Get-FileTree $DestinationRoot $DestinationFolder $Config $SourceCode
+    if ($destinationTree.HadError) { return $result }
+
+    $status = 'SUCCESS'
+    if ($Simulate) { $status = 'WHATIF' }
+
+    foreach ($file in $destinationTree.Files) {
+
+        if ($sourceFiles.ContainsKey($file.Relative.ToUpper())) { continue }
+        if (Test-FileExclusion $file.Relative $Config.Exclude) { continue }
+
+        try {
+            if (-not $Simulate) {
+                $target = New-Object System.IO.FileInfo($file.Info.FullName)
+                if ($target.Attributes -band [System.IO.FileAttributes]::ReadOnly) {
+                    $target.Attributes = $target.Attributes -bxor [System.IO.FileAttributes]::ReadOnly
+                }
+                [System.IO.File]::Delete($file.Info.FullName)
+            }
+
+            $result.Deleted++
+            Write-SyncLog -Server $SourceCode -Action 'DELETE' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status $status -Size (Format-FileSize $file.Info.Length) `
+                -ErrorText 'Not present on the source anymore'
+        }
+        catch {
+            Write-SyncLog -Server $SourceCode -Action 'DELETE' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status 'FAIL' -ErrorText $_.Exception.Message
+            $Script:Stats.Errors++
+        }
+    }
+
+    # deepest folders first, so a folder tree is emptied from the inside out
+    $extraFolders = @($destinationTree.Folders |
+        Where-Object { -not $sourceFolders.ContainsKey($_.ToUpper()) } |
+        Sort-Object -Property Length -Descending)
+
+    foreach ($relative in $extraFolders) {
+
+        $path = Join-NativePath $DestinationRoot $relative
+        if (-not [System.IO.Directory]::Exists($path)) { continue }
+
+        try {
+            # only if nothing is left inside, an excluded file must keep its folder
+            if (@([System.IO.Directory]::EnumerateFileSystemEntries($path)).Count -gt 0) { continue }
+
+            if (-not $Simulate) { [System.IO.Directory]::Delete($path) }
+
+            Write-SyncLog -Server $SourceCode -Action 'DELETE_FOLDER' -SourceFile $relative `
+                -DestinationServers $Script:LocalCode -Status $status `
+                -ErrorText 'Empty folder not present on the source anymore'
+        }
+        catch {
+            Write-SyncLog -Server $SourceCode -Action 'DELETE_FOLDER' -SourceFile $relative `
+                -DestinationServers $Script:LocalCode -Status 'WARNING' -ErrorText $_.Exception.Message
+            $Script:Stats.Warnings++
+        }
+    }
+
+    return $result
+}
+
+# One [INCLUDE] line ending with a backslash: the folder and everything below it
+function Sync-FolderEntry {
+    param($Config, [string]$SourceCode, [string]$SourceRoot, [string]$DestinationRoot,
+          [string]$Relative, [bool]$Simulate)
+
+    $result = [pscustomobject]@{ Copied = 0; Deleted = 0; Failed = 0 }
+
+    $sourceFolder = Join-NativePath $SourceRoot $Relative
+    $destinationFolder = Join-NativePath $DestinationRoot $Relative
+
+    $tree = Get-FileTree $SourceRoot $sourceFolder $Config $SourceCode
+
+    $maxBytes = [long]$Config.MaxFileSizeMB * 1MB
+    $status = 'SUCCESS'
+    if ($Simulate) { $status = 'WHATIF' }
+
+    # empty folders of the source are kept, the old /E did the same
+    if (-not $Simulate) {
+        foreach ($folder in $tree.Folders) {
+            $path = Join-NativePath $DestinationRoot $folder
+            if (-not [System.IO.Directory]::Exists($path)) {
+                try { [void][System.IO.Directory]::CreateDirectory($path) } catch { }
+            }
+        }
+    }
+
+    foreach ($file in $tree.Files) {
+
+        if (Test-FileExclusion $file.Relative $Config.Exclude) { continue }
+
+        if ($maxBytes -gt 0 -and $file.Info.Length -gt $maxBytes) {
+            Write-SyncLog -Server $SourceCode -Action 'SKIP' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status 'WARNING' -Size (Format-FileSize $file.Info.Length) `
+                -ErrorText "File bigger than MaxFileSizeMB ($($Config.MaxFileSizeMB)MB)"
+            $Script:Stats.Warnings++
+            continue
+        }
+
+        $destinationPath = Join-NativePath $DestinationRoot $file.Relative
+        $reason = Test-CopyNeeded $file.Info (New-Object System.IO.FileInfo($destinationPath))
+        if ($null -eq $reason) { continue }
+
+        if ($Simulate) {
+            $result.Copied++
+            $Script:Stats.Copied++
+            Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status $status -Size (Format-FileSize $file.Info.Length) `
+                -ErrorText $reason
+            continue
+        }
+
+        $copy = Copy-SyncFile $Config $file.Info $destinationPath
+
+        if ($copy.Success) {
+            $result.Copied++
+            $Script:Stats.Copied++
+            $Script:Stats.TotalDurationMs += $copy.DurationMs
+            Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status 'SUCCESS' -Size (Format-FileSize $file.Info.Length) `
+                -Duration "$($copy.DurationMs)ms" -ErrorText $reason
+        }
+        else {
+            $result.Failed++
+            $Script:Stats.Errors++
+            Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $file.Relative `
+                -DestinationServers $Script:LocalCode -Status 'FAIL' -Size (Format-FileSize $file.Info.Length) `
+                -Duration "$($copy.DurationMs)ms" -ErrorText $copy.ErrorText
+        }
+    }
+
+    # An empty or unreadable source is more often a share problem than a real deletion,
+    # so nothing is deleted at the destination in that case.
+    if ($Config.MirrorDeletions) {
+        if ($tree.HadError -or $tree.Files.Count -eq 0) {
+            Write-SyncLog -Server $SourceCode -Action 'MIRROR' -SourceFile $Relative `
+                -DestinationServers $Script:LocalCode -Status 'WARNING' `
+                -ErrorText 'Source folder empty or not readable, mirroring skipped for this folder (no deletion)'
+            $Script:Stats.Warnings++
+        }
+        else {
+            $removed = Remove-ExtraItem $Config $SourceCode $DestinationRoot $destinationFolder $tree $Simulate
+            $result.Deleted = $removed.Deleted
+        }
+    }
+
+    return $result
+}
+
+# One [INCLUDE] line without a backslash at the end: a single file, no size limit, no mirror
+function Sync-FileEntry {
+    param($Config, [string]$SourceCode, [string]$SourceRoot, [string]$DestinationRoot,
+          [string]$Relative, [bool]$Simulate)
+
+    $result = [pscustomobject]@{ Copied = 0; Deleted = 0; Failed = 0 }
+
+    $sourcePath = Join-NativePath $SourceRoot $Relative
+    $destinationPath = Join-NativePath $DestinationRoot $Relative
+
+    $sourceInfo = New-Object System.IO.FileInfo($sourcePath)
+    if (-not $sourceInfo.Exists) { return $result }
+
+    $reason = Test-CopyNeeded $sourceInfo (New-Object System.IO.FileInfo($destinationPath))
+    if ($null -eq $reason) { return $result }
+
+    if ($Simulate) {
+        $result.Copied++
+        $Script:Stats.Copied++
+        Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $Relative `
+            -DestinationServers $Script:LocalCode -Status 'WHATIF' -Size (Format-FileSize $sourceInfo.Length) `
+            -ErrorText $reason
+        return $result
+    }
+
+    $copy = Copy-SyncFile $Config $sourceInfo $destinationPath
+
+    if ($copy.Success) {
+        $result.Copied++
+        $Script:Stats.Copied++
+        $Script:Stats.TotalDurationMs += $copy.DurationMs
+        Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $Relative `
+            -DestinationServers $Script:LocalCode -Status 'SUCCESS' -Size (Format-FileSize $sourceInfo.Length) `
+            -Duration "$($copy.DurationMs)ms" -ErrorText $reason
+    }
+    else {
+        $result.Failed++
+        $Script:Stats.Errors++
+        Write-SyncLog -Server $SourceCode -Action 'COPY' -SourceFile $Relative `
+            -DestinationServers $Script:LocalCode -Status 'FAIL' -Size (Format-FileSize $sourceInfo.Length) `
+            -Duration "$($copy.DurationMs)ms" -ErrorText $copy.ErrorText
+    }
+
+    return $result
+}
+
+function Sync-SourceServer {
+    param($Config, [string]$SourceCode, [bool]$Simulate)
+
+    $result = [pscustomobject]@{ Copied = 0; Deleted = 0; Failed = 0 }
+
+    $sourceRoot = Get-SourceRoot $Config $SourceCode
+    $destinationRoot = Join-NativePath $Config.DestinationBasePath $SourceCode
+
+    $reachable = $false
+    $reason = 'Source folder not reachable (network, share or permissions)'
+    try {
+        $reachable = [System.IO.Directory]::Exists($sourceRoot)
+    }
+    catch {
+        $reason = $_.Exception.Message
+    }
+
+    if (-not $reachable) {
+        Write-SyncLog -Server $SourceCode -Action 'SCAN' -SourceFile $sourceRoot `
+            -DestinationServers $Script:LocalCode -Status 'FAIL' -ErrorText $reason
+        $Script:Stats.Errors++
+        $result.Failed++
+        return $result
+    }
+
+    foreach ($entry in $Config.Include) {
+
+        $isFolderEntry = $entry.EndsWith('\') -or $entry.EndsWith('/')
+        $relative = $entry.TrimEnd('\', '/')
+        $sourcePath = Join-NativePath $sourceRoot $relative
+
+        $exists = $false
+        try {
+            if ($isFolderEntry) { $exists = [System.IO.Directory]::Exists($sourcePath) }
+            else { $exists = [System.IO.File]::Exists($sourcePath) }
+        }
+        catch { $exists = $false }
+
+        if (-not $exists) {
+            Write-SyncLog -Server $SourceCode -Action 'SCAN' -SourceFile $entry `
+                -DestinationServers $Script:LocalCode -Status 'WARNING' `
+                -ErrorText 'INCLUDE path does not exist on the source server'
+            $Script:Stats.Warnings++
+            continue
+        }
+
+        $watch = [System.Diagnostics.Stopwatch]::StartNew()
+
+        if ($isFolderEntry) {
+            $entryResult = Sync-FolderEntry $Config $SourceCode $sourceRoot $destinationRoot $relative $Simulate
+        }
+        else {
+            $entryResult = Sync-FileEntry $Config $SourceCode $sourceRoot $destinationRoot $relative $Simulate
+        }
+
+        $watch.Stop()
+
+        $result.Copied += $entryResult.Copied
+        $result.Deleted += $entryResult.Deleted
+        $result.Failed += $entryResult.Failed
+
+        Write-SyncLog -Server $SourceCode -Action 'SYNC' -SourceFile $entry `
+            -DestinationServers $Script:LocalCode -Status 'SUCCESS' `
+            -Size ("{0} copied, {1} deleted" -f $entryResult.Copied, $entryResult.Deleted) `
+            -Duration "$($watch.ElapsedMilliseconds)ms" `
+            -ErrorText ("{0} error(s)" -f $entryResult.Failed)
+    }
+
+    return $result
+}
+
 
 # ------------------------------------------------------------------- cycle --
 
@@ -971,15 +1080,15 @@ function Invoke-SyncCycle {
             return $cycle
         }
 
-        $jobs = @(Get-RobocopyJob $Config $SourceServers $Simulate)
-
         Write-SyncLog -Action 'SCAN' -SourceFile "$($SourceServers.Count) source server(s)" `
-            -DestinationServers $Script:LocalCode -Status 'SUCCESS' -Size "$($jobs.Count) robocopy job(s)"
+            -DestinationServers $Script:LocalCode -Status 'START'
 
-        $result = Invoke-AllRobocopyJob $Config $jobs
-        $cycle.Copied = $result.Copied
-        $cycle.Deleted = $result.Deleted
-        $cycle.Failed = $result.Failed
+        foreach ($sourceCode in $SourceServers) {
+            $result = Sync-SourceServer $Config $sourceCode $Simulate
+            $cycle.Copied += $result.Copied
+            $cycle.Deleted += $result.Deleted
+            $cycle.Failed += $result.Failed
+        }
     }
     catch {
         Write-SyncLog -Action 'CYCLE' -Status 'CRITICAL' -ErrorText "Unexpected error: $($_.Exception.Message)"
@@ -1038,7 +1147,7 @@ function Start-Sync {
     Write-SyncLog -Action 'CONFIG' -SourceFile $config.ConfigPath -DestinationServers $Script:LocalCode -Status 'SUCCESS' `
         -ErrorText ("$($Script:LocalCode) ($localEnvironment) pulls from ${sourceEnvironment}: $($sourceServers -join ',');" +
                     " interval $($config.SyncIntervalMinutes)min; max $($config.MaxFileSizeMB)MB;" +
-                    " robocopy /MT:$($config.RobocopyThreads); mirror deletions: $($config.MirrorDeletions)")
+                    " native PowerShell copy; mirror deletions: $($config.MirrorDeletions)")
 
     Remove-OldLog $config
 
